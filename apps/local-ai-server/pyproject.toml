@@ -1,0 +1,9 @@
+[project]
+name = "voxflow-local-engine"
+version = "0.1.0"
+description = "Placeholder local AI engine for VoxFlow"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.ruff]
+line-length = 100

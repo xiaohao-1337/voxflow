@@ -1,0 +1,1 @@
+"""Placeholder CosyVoice provider adapter."""

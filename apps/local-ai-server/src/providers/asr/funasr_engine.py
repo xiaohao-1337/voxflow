@@ -1,0 +1,1 @@
+"""Placeholder FunASR provider adapter."""

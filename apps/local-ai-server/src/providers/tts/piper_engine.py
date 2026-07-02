@@ -1,0 +1,1 @@
+"""Placeholder Piper provider adapter."""

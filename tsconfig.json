@@ -1,0 +1,12 @@
+{
+  // 继承 WXT 自动生成的 tsconfig(含路径别名、wxt 客户端类型与 imports.d.ts 自动导入)。
+  // 注意:不要 exclude ".wxt"——imports.d.ts 在其中,defineBackground 等自动导入依赖它。
+  "extends": "./.wxt/tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "forceConsistentCasingInFileNames": true,
+    "jsx": "react-jsx"
+  }
+}

@@ -1,0 +1,1 @@
+"""Placeholder LibreTranslate provider adapter."""
