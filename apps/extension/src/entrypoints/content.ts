@@ -1,5 +1,3 @@
-import { startAudioCapture, type AudioCaptureHandle } from '../core/audio/audio-capture';
-import { findMainVideo } from '../core/audio/media';
 import { SubtitleOverlay } from '../core/subtitles/subtitle-overlay';
 import { connectPcmPort, onTabMessage, sendControl } from '../messaging/bridge';
 import type { PcmPort } from '../messaging/bridge';
@@ -11,15 +9,15 @@ export default defineContentScript({
   matches: ['<all_urls>'],
   runAt: 'document_idle',
   main() {
-    let handle: AudioCaptureHandle | null = null;
     let port: PcmPort | null = null;
     let overlay: SubtitleOverlay | null = null;
     let startPromise: Promise<void> | null = null;
+    let videoTimer: number | null = null;
     let seq = 0;
 
     onTabMessage((msg) => {
       if (msg.kind === 'START_CAPTURE') void start();
-      if (msg.kind === 'STOP_CAPTURE') cleanup();
+      if (msg.kind === 'STOP_CAPTURE') cleanup(false);
     });
 
     onSettingsChanged((settings) => {
@@ -44,19 +42,14 @@ export default defineContentScript({
     }
 
     async function startInner(): Promise<void> {
-      if (handle) return;
-      const video = findMainVideo();
-      if (!video) {
-        sendCaptureState(false, 'No video element was found on this page.');
-        return;
-      }
+      if (port) return;
 
       overlay = new SubtitleOverlay();
       overlay.show();
       overlay.update({
         original: '',
         translated: '',
-        hint: 'Capturing page audio. Original audio is intercepted by Web Audio.',
+        hint: 'Capturing tab audio through Chrome tabCapture.',
         partial: true,
       });
 
@@ -65,30 +58,23 @@ export default defineContentScript({
         if (msg.kind === 'SUBTITLE') overlay?.update(msg.payload);
       });
       port.onDisconnect(() => {
-        handle?.stop();
-        handle = null;
+        if (videoTimer !== null) window.clearInterval(videoTimer);
+        videoTimer = null;
         port = null;
       });
       safePost({ kind: 'READY', tabId: 0, url: location.href });
 
       try {
-        handle = await startAudioCapture(video, {
-          onPcm(frame) {
-            safePost({
-              kind: 'PCM',
-              seq: seq++,
-              samples: frame.samples.buffer as ArrayBuffer,
-              sampleRate: frame.sampleRate,
-              timestamp: performance.now(),
-              videoTime: video.currentTime,
-              rms: frame.rms,
-              peak: frame.peak,
-            });
-          },
-          onVideoTime(state) {
-            safePost({ kind: 'VIDEO_TIME', ...state });
-          },
-        });
+        videoTimer = window.setInterval(() => {
+          const video = document.querySelector<HTMLVideoElement>('video');
+          if (!video) return;
+          safePost({
+            kind: 'VIDEO_TIME',
+            current: video.currentTime,
+            paused: video.paused,
+            playbackRate: video.playbackRate,
+          });
+        }, 250);
         sendCaptureState(true);
       } catch (error) {
         const detail = reportError(error);
@@ -100,8 +86,8 @@ export default defineContentScript({
 
     function cleanup(removeOverlay = true): void {
       startPromise = null;
-      handle?.stop();
-      handle = null;
+      if (videoTimer !== null) window.clearInterval(videoTimer);
+      videoTimer = null;
       try {
         port?.raw.disconnect();
       } catch {
@@ -109,6 +95,7 @@ export default defineContentScript({
       }
       port = null;
       seq = 0;
+
       if (removeOverlay) {
         overlay?.remove();
         overlay = null;

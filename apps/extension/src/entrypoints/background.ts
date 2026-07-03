@@ -70,8 +70,9 @@ async function handleRequestCapture(tabId: number | null): Promise<void> {
 }
 
 async function ensurePipeline(settings: Settings, tabId: number | null): Promise<void> {
+  const streamId = tabId ? await getTabAudioStreamId(tabId) : null;
   await ensureOffscreen();
-  await sendControl({ kind: 'START_PIPELINE', settings, tabId });
+  await sendControl({ kind: 'START_PIPELINE', settings, tabId, streamId });
 }
 
 function ensureOffscreen(): Promise<void> {
@@ -149,6 +150,19 @@ async function sendToTabWithInjection(tabId: number, msg: TabMessage): Promise<u
 async function getActiveTab(): Promise<chrome.tabs.Tab | null> {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   return tab ?? null;
+}
+
+function getTabAudioStreamId(tabId: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
+      const error = chrome.runtime.lastError;
+      if (error || !streamId) {
+        reject(new Error(error?.message ?? 'Unable to create tab audio stream id'));
+        return;
+      }
+      resolve(streamId);
+    });
+  });
 }
 
 function broadcastStatus(status: RuntimeStatus): void {

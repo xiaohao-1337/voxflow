@@ -16,7 +16,7 @@ export type LocalEngineClientMessage =
       timestampMs: number;
       sampleRate: 16000;
       format: 'f32le' | 'pcm16';
-      audio: ArrayBuffer;
+      audio: string;
     }
   | { type: 'media.state'; sessionId: string; currentTime: number; paused: boolean; playbackRate: number }
   | { type: 'session.stop'; sessionId: string };
@@ -42,6 +42,6 @@ export type LocalEngineServerMessage =
       sampleRate: number;
       sourceStartMs: number;
       sourceEndMs: number;
-      audio: ArrayBuffer;
+      audio: string;
     }
   | { type: 'error'; sessionId: string; code: string; message: string };

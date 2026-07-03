@@ -10,7 +10,7 @@ export type ControlMessage =
   | { kind: 'GET_SETTINGS' }
   | { kind: 'UPDATE_SETTINGS'; patch: Partial<Settings> }
   | { kind: 'REQUEST_CAPTURE' }
-  | { kind: 'START_PIPELINE'; settings: Settings; tabId: number | null }
+  | { kind: 'START_PIPELINE'; settings: Settings; tabId: number | null; streamId?: string | null }
   | { kind: 'STOP_PIPELINE' }
   | { kind: 'PING_READY' }
   | { kind: 'OFFSCREEN_READY' }
@@ -27,7 +27,7 @@ export type PcmPortMessage =
   | {
       kind: 'PCM';
       seq: number;
-      samples: ArrayBuffer;
+      samples: number[];
       sampleRate: number;
       timestamp: number;
       videoTime: number;
