@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 from src.config import DEFAULT_ASR_LANGUAGE, DEFAULT_ASR_MODEL
 from src.providers.asr.funasr_engine import FunAsrConfig, FunAsrEngine, FunAsrUnavailable, get_funasr_engine
-from src.providers.mt.argos_engine import translate_to_zh
+from src.pipeline.translation_pipeline import translate_to_zh
 from src.utils.audio import f32le_stats, pcm16_silence
 
 
