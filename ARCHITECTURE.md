@@ -1,842 +1,1011 @@
-# VoxFlow 架构设计方案
+# VoxFlow 架构说明
 
-> 本文档是 VoxFlow 的架构设计基线。
+> 最后更新：2026-07-28
 >
-> 当前路线：Chrome 扩展负责捕获网页视频音频、静音原声、播放译文音频；本地 AI 服务负责 ASR、翻译与 TTS。核心原则是免费开源、可本地部署、隐私优先、低延迟同传。
+> 适用版本：`0.1.0` 当前工作树
+>
+> 文档性质：当前实现基线 + 明确标注的演进设计
 
----
+VoxFlow 是一个本地优先的网页视频语音翻译系统，由 Chrome / Edge Manifest V3 扩展和 Python 本地 AI 服务组成。
 
-## 1. 产品目标
-
-VoxFlow 是一款可在 Chrome/Edge 浏览器中使用的实时视频声音翻译扩展。
-
-目标能力：
-
-1. 捕获网页中正在播放的视频声音。
-2. 将源语言语音识别为文本，例如英文语音转英文文本。
-3. 将源语言文本翻译为目标语言文本，例如英文文本转中文文本。
-4. 将目标语言文本合成为目标语言语音，例如中文文本转中文语音。
-5. 自动静音网页原声，只播放翻译后的语音。
-6. 尽量让译文语音与视频画面保持可接受同步。
-
-产品定位：
-
-- 不是单纯字幕翻译工具，字幕只是辅助展示。
-- 核心体验是“实时同传配音”。
-- 不追求零延迟口型级对齐，优先实现低延迟、可持续、可本地部署的实时翻译声音。
-- 默认首个语向为 `English -> Chinese`，架构上支持扩展到更多语种。
-
----
-
-## 2. 总体路线
-
-最终采用路线为：拆分式本地 AI 管线。
+当前已跑通的主链路是：
 
 ```text
-网页视频音频
-  -> Chrome Extension 音频捕获
-  -> 本地 AI 服务 FunASR 语音识别
-  -> 本地翻译引擎
-  -> 本地 TTS 引擎
-  -> Chrome Extension 播放译文音频
+chrome.tabCapture
+  → Offscreen AudioWorklet
+  → 16 kHz mono Float32 PCM
+  → 约 7 秒分段
+  → WebSocket voxflow.local.v1
+  → FunASR SenseVoiceSmall
+  → MarianMT English-to-Chinese
+  → 网页双语文本浮层
 ```
 
-与纯云端方案相比：
+当前尚未实现 VAD、增量 ASR、TTS、译文音频播放和音画同步。本文会严格区分：
 
-- 不上传用户音频，隐私更好。
-- 不依赖第三方 API Key。
-- 长期使用成本更低。
-- 可根据机器性能选择不同模型档位。
+- **当前实现**：代码已经进入实际运行路径。
+- **骨架 / 预留**：已有类型、目录或空实现，但没有进入产品链路。
+- **目标设计**：后续建议，不应被理解为现有能力。
 
-与浏览器内直接跑大模型相比：
+## 阅读导航
 
-- 更稳定，不受 MV3 扩展沙箱、CSP、WebAssembly/WebGPU 限制过多影响。
-- 更适合 FunASR、CosyVoice、Piper、CTranslate2 等 Python/本地推理生态。
-- 更容易做模型下载、GPU 加速、日志、性能监控和后续桌面端封装。
+- [产品边界与实现状态](#1-产品目标与边界)：第 1～2 节
+- [系统上下文与仓库结构](#3-系统上下文)：第 3～4 节
+- [浏览器扩展、时序与音频路径](#5-浏览器扩展架构)：第 5～7 节
+- [本地服务、协议与状态](#8-本地-ai-服务架构)：第 8～10 节
+- [模型、安全、性能与目标管线](#11-模型与文件布局)：第 11～14 节
+- [测试、架构决策与演进](#15-测试与验证)：第 15～19 节
 
----
+## 1. 产品目标与边界
 
-## 3. 核心技术选型
+### 1.1 产品目标
 
-| 层级 | 选型 | 说明 |
+VoxFlow 希望最终提供以下体验：
+
+1. 捕获网页中正在播放的视频声音。
+2. 在本机完成源语言语音识别。
+3. 在本机完成目标语言文本翻译。
+4. 在本机生成目标语言语音。
+5. 用译文语音替代原声，并维持可接受的音画同步。
+6. 默认不上传原始音频、识别文本和翻译文本。
+
+首个稳定语向为：
+
+```text
+English speech → English text → Simplified Chinese text
+```
+
+### 1.2 当前非目标
+
+- 不支持 Netflix、Disney+ 等 DRM / Widevine 强保护内容。
+- 不承诺任意网站都能捕获音频。
+- 不支持多用户或多租户推理服务。
+- 不提供云端托管、账号、计费或远程 API。
+- 当前不提供实时中文配音。
+- 当前不追求口型级同步。
+- Firefox 构建脚本存在，但主音频链路依赖 Chromium `chrome.tabCapture`。
+
+## 2. 实现状态总览
+
+| 子系统 | 状态 | 说明 |
 |---|---|---|
-| 浏览器扩展 | Chrome Manifest V3 | Chrome/Edge 主流扩展标准 |
-| 扩展语言 | TypeScript | 强类型约束消息协议、状态机、音频管线 |
-| 扩展构建 | WXT 或 Vite + CRX 插件 | 当前工程已有 WXT 基础，可继续使用 |
-| 扩展 UI | React + TypeScript | popup/options/状态面板 |
-| 音频捕获 | Web Audio API + AudioWorklet | 从网页 video 捕获 PCM，降采样分帧 |
-| 扩展持久媒体宿主 | Offscreen Document | MV3 下承载 WebSocket、Web Audio 播放、管线状态 |
-| 扩展后台 | Service Worker | 轻量调度、offscreen 生命周期、状态路由 |
-| 本地服务语言 | Python 3.10+ | 适配 FunASR、TTS、翻译模型生态 |
-| 本地服务框架 | FastAPI + WebSocket | 低延迟音频流通信 |
-| ASR | FunASR | 阿里开源，可本地部署，支持实时/离线识别 |
-| VAD | FunASR FSMN-VAD 或 Silero VAD | 用于语音边界检测和低延迟分段 |
-| 标点 | FunASR punctuation model | 提升翻译与 TTS 可读性 |
-| 翻译 | Argos Translate / LibreTranslate / CTranslate2 | 优先免费开源、可本地部署 |
-| TTS | CosyVoice / Piper | 优先本地语音合成；Piper 作为轻量 fallback |
-| 音频播放 | Web Audio API | 播放本地服务返回的 PCM/WAV/Opus 音频 |
+| WXT / React / TypeScript 扩展 | 已实现 | 根目录统一构建，没有独立的 `apps/extension/package.json` |
+| Manifest V3 Service Worker | 已实现 | 管理开关、标签页、Offscreen 与状态路由 |
+| `chrome.tabCapture` | 已实现 | 当前唯一产品主捕获路径 |
+| Offscreen Document | 已实现 | 承载捕获 AudioContext、WebSocket 和分段 |
+| AudioWorklet 降采样 | 已实现 | 48 kHz 左右输入转 16 kHz mono，30 ms 一帧 |
+| Content Script 字幕浮层 | 已实现 | 显示原文、译文和运行提示 |
+| 约 7 秒固定分段 | 已实现 | 1.2 秒最小段、12 秒离线保留上限 |
+| 本地 WebSocket 网关 | 已实现 | Python `asyncio` 标准库实现 |
+| `voxflow.local.v1` | 已实现 | JSON 文本帧承载 Base64 PCM |
+| FunASR ASR | 已实现 | SenseVoiceSmall，整段临时 WAV 推理 |
+| MarianMT 英译中 | 已实现 | Transformers + PyTorch，本地模型 |
+| 服务断线重连 | 已实现 | Offscreen 每 2 秒重试 |
+| VAD | 骨架 | `vad_segmenter.py` 仅占位 |
+| ASR partial / streaming | 协议预留 | 当前服务只产生 `asr.final` |
+| TTS | 骨架 | Piper / CosyVoice 文件为空实现，请求会失败 |
+| 音频播放与同步 | 骨架 | Player / Scheduler / Lag Manager 未接入 |
+| 共享 protocol package | 部分实现 | 类型已定义，但扩展仍使用内部副本 |
+| 共享 audio package | 部分实现 | PCM16 转换可用，重采样与 WAV 仍占位 |
+| Docker / 安装脚本 | 骨架 | `infra` 目录暂无可部署实现 |
 
----
-
-## 4. 系统架构
+## 3. 系统上下文
 
 ```mermaid
 flowchart LR
-  subgraph Browser["Chrome Extension"]
+  User["用户"] --> Browser["Chrome / Edge"]
+  Page["普通网页视频"] --> Browser
+
+  subgraph Extension["VoxFlow MV3 Extension"]
     Popup["Popup / Options"]
     SW["Service Worker"]
-    CS["Content Script"]
-    OD["Offscreen Document"]
-    AW["AudioWorklet"]
-    Player["Translated Audio Player"]
+    Content["Content Script"]
+    Offscreen["Offscreen Document"]
+    Worklet["AudioWorklet"]
   end
 
-  subgraph Local["voxflow-local-engine"]
-    WS["FastAPI WebSocket Gateway"]
-    Session["Session Manager"]
-    VAD["VAD Segmenter"]
-    ASR["FunASR Streaming ASR"]
-    MT["Local Translation"]
-    TTS["Local TTS"]
+  subgraph Engine["voxflow-local-engine"]
+    Gateway["asyncio WebSocket Gateway"]
+    Session["LocalEngineSession"]
+    ASR["FunASR SenseVoiceSmall"]
+    MT["MarianMT / OPUS-MT"]
   end
 
-  Page["Web Video Page"] --> CS
-  CS --> AW
-  AW --> OD
-  OD <--> WS
-  WS --> Session
-  Session --> VAD
-  VAD --> ASR
-  ASR --> MT
-  MT --> TTS
-  TTS --> WS
-  WS --> OD
-  OD --> Player
-  Popup --> SW
-  SW --> CS
-  SW --> OD
+  Browser --> Extension
+  Popup <--> SW
+  SW <--> Content
+  SW <--> Offscreen
+  Offscreen <--> Worklet
+  Offscreen <-->|"ws://127.0.0.1:8765/ws"| Gateway
+  Gateway --> Session
+  Session --> ASR
+  Session --> MT
+  Content --> Page
 ```
 
-### 4.1 Chrome Extension 职责
+核心边界：
 
-扩展只做浏览器侧能力，不直接运行大模型。
+- 浏览器扩展负责权限、媒体捕获、交互、状态与展示。
+- 本地服务负责模型生命周期、音频校验、ASR 和翻译。
+- 两侧只通过版本化 WebSocket 协议耦合。
+- 模型文件不打包进扩展，避免 Manifest V3、CSP、内存和包体限制。
 
-职责：
-
-- 捕获当前网页视频音频。
-- 静音网页原声。
-- 将 PCM 音频流发送给本地 AI 服务。
-- 接收 ASR/翻译/TTS 结果。
-- 播放目标语言音频。
-- 显示双语字幕、状态、延迟、错误提示。
-- 管理用户设置，例如源语言、目标语言、本地服务地址、延迟模式。
-
-### 4.2 Local AI Engine 职责
-
-本地服务承担全部 AI 计算。
-
-职责：
-
-- WebSocket 接收扩展发送的音频帧。
-- 对音频做 VAD、分段、缓冲、时间戳管理。
-- 调用 FunASR 完成实时语音识别。
-- 调用本地翻译引擎完成文本翻译。
-- 调用本地 TTS 引擎生成目标语言音频。
-- 将 partial ASR、final ASR、翻译文本、TTS 音频返回扩展。
-- 做性能监控、模型加载、错误恢复和资源释放。
-
----
-
-## 5. Chrome MV3 执行环境设计
-
-| 执行环境 | 能力限制 | 主要职责 |
-|---|---|---|
-| Service Worker | 无 DOM、易被回收 | 开关状态、offscreen 生命周期、content script 注入、状态广播 |
-| Content Script | 运行在网页上下文附近，随页面销毁 | video 发现、音频接管、原声静音、字幕浮层 |
-| Offscreen Document | 有 DOM/Web Audio，可较持久运行 | WebSocket、本地服务通信、译文音频播放、状态桥接 |
-| AudioWorklet | 实时音频线程 | 混音、重采样、分帧、输出 PCM |
-| Popup/Options | 用户界面 | 开关、设置、状态展示、错误提示 |
-
-关键原则：
-
-- Service Worker 只做轻量调度，不处理音频与 AI。
-- Content Script 只做页面相关工作，不运行重模型。
-- Offscreen Document 是浏览器侧“媒体管线宿主”。
-- 大模型全部下沉到 `voxflow-local-engine`。
-
----
-
-## 6. 音频捕获与静音方案
-
-### 6.1 主路径：Web Audio 接管 video
-
-在 Content Script 中找到页面主视频元素，使用 Web Audio 接管视频音频：
-
-```ts
-const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
-const source = ctx.createMediaElementSource(video);
-const worklet = new AudioWorkletNode(ctx, 'voxflow-pcm-capture');
-const sink = ctx.createMediaStreamDestination();
-
-source.connect(worklet);
-worklet.connect(sink);
-// 不连接 ctx.destination，因此原视频声音不会外放。
-```
-
-效果：
-
-- 音频进入 Web Audio 图。
-- AudioWorklet 可以拿到 PCM。
-- 因为不连接扬声器输出，原声被静音。
-- 不需要设置 `video.muted = true`，避免静音后采集到的也是静音。
-
-AudioWorklet 输出格式：
-
-```text
-sampleRate: 16000 Hz
-channels: mono
-sampleFormat: Float32 或 PCM16
-chunkSize: 20ms - 100ms，建议 MVP 使用 30ms 或 60ms
-```
-
-### 6.2 兜底路径：chrome.tabCapture
-
-当 Web Audio 接管失败时，例如：
-
-- 跨域直链视频导致 CORS 污染。
-- 页面已有其他脚本调用过 `createMediaElementSource`。
-- 特殊播放器无法通过 `<video>` 稳定接管。
-
-可回退到 `chrome.tabCapture` 捕获标签页音频。
-
-注意：
-
-- `tabCapture` 更接近捕获标签页最终输出混音。
-- 用户授权和 Chrome 权限要求更严格。
-- 需要实测不同网站行为。
-- DRM/受保护内容不作为支持目标。
-
-### 6.3 不支持范围
-
-- Netflix、Disney+ 等 DRM/Widevine 强保护内容。
-- 浏览器或网站条款禁止捕获的内容。
-- 非标准播放器中无法获取音频的场景。
-
----
-
-## 7. 本地 AI 管线设计
-
-```mermaid
-flowchart TD
-  A["PCM Audio Chunk"] --> B["Audio Buffer"]
-  B --> C["VAD"]
-  C --> D["Speech Segment"]
-  D --> E["FunASR Streaming ASR"]
-  E --> F["Text Stabilizer"]
-  F --> G["Punctuation"]
-  G --> H["Local Translation"]
-  H --> I["TTS Text Normalizer"]
-  I --> J["Local TTS"]
-  J --> K["Audio Packet"]
-```
-
-### 7.1 VAD
-
-推荐顺序：
-
-1. FunASR 自带 FSMN-VAD。
-2. Silero VAD 作为替代或实验选项。
-3. 能量法仅作为 debug fallback，不作为正式质量方案。
-
-VAD 输出事件：
-
-```text
-speech-start
-speech-frame
-speech-end
-```
-
-用途：
-
-- 减少静音段送入 ASR 的计算浪费。
-- 形成更自然的话语边界。
-- 在 `speech-end` 时触发 ASR flush。
-- 在静音间隙让 TTS 队列追赶。
-
-### 7.2 ASR：FunASR
-
-FunASR 是主 ASR 引擎。
-
-第一版目标：
-
-- 支持英文视频转中文。
-- 支持 16kHz mono PCM 输入。
-- 支持流式或近实时识别。
-- 支持 partial/final 区分。
-- 支持按话语边界 flush。
-
-推荐模型策略：
-
-| 场景 | 推荐方向 |
-|---|---|
-| 低延迟 MVP | FunASR streaming Paraformer / SenseVoiceSmall |
-| 多语言扩展 | SenseVoiceSmall / Fun-ASR-Nano / Qwen-ASR 系列按需评估 |
-| CPU 机器 | 小模型、量化、较大 chunk、允许更高延迟 |
-| GPU 机器 | 更高质量模型、更短延迟、更好准确率 |
-
-ASR 输出：
-
-```json
-{
-  "type": "asr.final",
-  "text": "hello everyone welcome to this video",
-  "startMs": 1200,
-  "endMs": 3600
-}
-```
-
-### 7.3 文本稳定与分句
-
-实时 ASR 会产生变化中的 partial 文本。设计规则：
-
-- partial 文本只用于字幕预览。
-- final 文本才进入翻译和 TTS。
-- 对过短、明显不完整的片段做延迟合并。
-- 在句号、逗号、停顿、VAD speech-end 时提交翻译。
-- 不等待整段长句结束，优先低延迟。
-
-### 7.4 翻译
-
-优先本地开源方案。
-
-MVP 推荐：
-
-- Argos Translate：部署简单，适合快速验证。
-- LibreTranslate：可作为本地 HTTP 翻译服务，但需注意许可证。
-
-产品化推荐：
-
-- CTranslate2 + OPUS-MT / NLLB。
-- 支持量化、CPU/GPU 推理、性能更可控。
-
-翻译策略：
-
-- 按 ASR final segment 增量翻译。
-- 保留上下文窗口，例如最近 2-5 个 segment，提高指代和术语一致性。
-- 翻译输出进入 TTS 前做简单文本规范化。
-
-### 7.5 TTS
-
-优先本地 TTS。
-
-推荐组合：
-
-| TTS | 用途 | 特点 |
-|---|---|---|
-| CosyVoice | 高质量中文/多语言语音 | 音质更好，资源占用更高 |
-| Piper | 轻量 fallback | CPU 友好，部署简单 |
-| 系统 TTS/chrome.tts | 应急 fallback | 简单但排程和音频控制较弱 |
-
-正式路线：
-
-- 本地服务生成音频数据。
-- 扩展 Offscreen Document 通过 Web Audio 播放。
-- 不优先使用 `speechSynthesis` 作为主 TTS，因为它难以精确控制音频 buffer 和播放排程。
-
----
-
-## 8. 同步与延迟策略
-
-实时翻译声音一定存在延迟。VoxFlow 的目标不是零延迟，而是“稳定、可理解、尽量低延迟”。
-
-### 8.1 延迟目标
-
-| 阶段 | MVP 目标 |
-|---|---:|
-| 音频采集与传输 | 30-150ms |
-| VAD 分段 | 50-300ms |
-| FunASR partial | 300-1000ms |
-| ASR final | 800-2000ms |
-| 翻译 | 50-500ms |
-| TTS 首包 | 300-1500ms |
-| 播放缓冲 | 300-1000ms |
-| 端到端 | 2-5s |
-
-### 8.2 两种工作模式
-
-| 模式 | 说明 | 适用场景 |
-|---|---|---|
-| 低延迟模式 | 视频不暂停，译文语音略落后 | 直播、访谈、短视频 |
-| 同步优先模式 | 启动时建立 2-4 秒缓冲，必要时轻微调节播放 | 课程、长视频、录播 |
-
-### 8.3 播放调度
-
-每个译文音频片段需要携带源时间戳：
-
-```json
-{
-  "type": "tts.audio",
-  "seq": 12,
-  "sourceStartMs": 1200,
-  "sourceEndMs": 3600,
-  "audioStartMs": 0,
-  "durationMs": 1800
-}
-```
-
-Offscreen Document 维护播放队列：
-
-- 按 `sourceStartMs` 排序。
-- 与当前 `video.currentTime` 计算 lag。
-- lag 过小时等待。
-- lag 过大时加速、跳过低价值片段或丢弃过期片段。
-- speech-end 静音间隙优先排空队列。
-
-### 8.4 背压策略
-
-必须避免直播越看越落后。
-
-规则：
-
-- 队列累计延迟超过阈值，例如 4-6 秒，触发背压。
-- 优先丢弃短语气词、重复片段、过旧片段。
-- 必要时只保留最新完整句。
-- UI 显示“正在追赶实时”。
-
----
-
-## 9. 通信协议
-
-### 9.1 扩展内部消息
-
-扩展内部继续使用类型化消息协议。
-
-```ts
-type ControlMessage =
-  | { kind: 'TOGGLE'; on: boolean }
-  | { kind: 'GET_STATUS' }
-  | { kind: 'UPDATE_SETTINGS'; patch: Partial<Settings> }
-  | { kind: 'START_PIPELINE'; settings: Settings }
-  | { kind: 'STOP_PIPELINE' }
-  | { kind: 'PIPELINE_STATUS'; status: RuntimeStatus };
-
-type PcmPortMessage =
-  | { kind: 'PCM'; samples: ArrayBuffer; sampleRate: number; ts: number }
-  | { kind: 'VIDEO_TIME'; current: number }
-  | { kind: 'SUBTITLE'; payload: SubtitlePayload }
-  | { kind: 'END' };
-```
-
-### 9.2 扩展到本地服务 WebSocket
-
-连接地址默认：
-
-```text
-ws://127.0.0.1:8765/ws
-```
-
-客户端到服务端：
-
-```ts
-type LocalEngineClientMessage =
-  | {
-      type: 'session.start';
-      sessionId: string;
-      sourceLang: string;
-      targetLang: string;
-      sampleRate: 16000;
-      asrProvider: 'funasr';
-      mtProvider: 'argos' | 'libretranslate' | 'ctranslate2';
-      ttsProvider: 'cosyvoice' | 'piper';
-    }
-  | {
-      type: 'audio.chunk';
-      sessionId: string;
-      seq: number;
-      timestampMs: number;
-      sampleRate: 16000;
-      format: 'f32le' | 'pcm16';
-      audio: ArrayBuffer;
-    }
-  | {
-      type: 'media.state';
-      sessionId: string;
-      currentTime: number;
-      paused: boolean;
-      playbackRate: number;
-    }
-  | {
-      type: 'session.stop';
-      sessionId: string;
-    };
-```
-
-服务端到客户端：
-
-```ts
-type LocalEngineServerMessage =
-  | {
-      type: 'engine.status';
-      sessionId: string;
-      state: 'loading' | 'ready' | 'running' | 'error';
-      message?: string;
-    }
-  | {
-      type: 'asr.partial';
-      sessionId: string;
-      text: string;
-      startMs?: number;
-      endMs?: number;
-    }
-  | {
-      type: 'asr.final';
-      sessionId: string;
-      text: string;
-      startMs: number;
-      endMs: number;
-    }
-  | {
-      type: 'translation.final';
-      sessionId: string;
-      sourceText: string;
-      translatedText: string;
-      sourceStartMs: number;
-      sourceEndMs: number;
-    }
-  | {
-      type: 'tts.audio';
-      sessionId: string;
-      seq: number;
-      text: string;
-      audioFormat: 'pcm16' | 'wav' | 'opus';
-      sampleRate: number;
-      sourceStartMs: number;
-      sourceEndMs: number;
-      audio: ArrayBuffer;
-    }
-  | {
-      type: 'error';
-      sessionId: string;
-      code: string;
-      message: string;
-    };
-```
-
----
-
-## 10. 安全与隐私
-
-### 10.1 本地服务安全
-
-本地服务必须：
-
-- 默认只监听 `127.0.0.1`。
-- 不监听 `0.0.0.0`，除非用户显式开启局域网模式。
-- 首次启动生成本地 token。
-- 扩展连接 WebSocket 时必须携带 token。
-- 支持 CORS/Origin 检查，只允许 VoxFlow 扩展来源。
-- 默认不保存原始音频。
-- debug 音频落盘必须由用户显式开启。
-
-### 10.2 模型与数据
-
-- 模型文件保存在本地用户目录或项目指定目录。
-- 不上传音频、识别文本、翻译文本。
-- 日志默认不记录完整音频内容。
-- 错误日志可记录模型名、延迟、状态，但应避免泄露用户观看内容。
-
----
-
-## 11. 工程目录设计
-
-最终推荐目录：
+## 4. 仓库结构与代码所有权
 
 ```text
 voxflow/
 ├── apps/
 │   ├── extension/
+│   │   └── src/
+│   │       ├── entrypoints/
+│   │       │   ├── background.ts
+│   │       │   ├── content.ts
+│   │       │   ├── offscreen/main.ts
+│   │       │   ├── popup/
+│   │       │   └── options/
+│   │       ├── core/
+│   │       │   ├── audio/
+│   │       │   ├── engine/
+│   │       │   ├── playback/
+│   │       │   └── subtitles/
+│   │       ├── messaging/
+│   │       ├── store/
+│   │       └── public/
+│   ├── local-ai-server/
 │   │   ├── src/
-│   │   │   ├── entrypoints/
-│   │   │   │   ├── background.ts
-│   │   │   │   ├── content.ts
-│   │   │   │   ├── offscreen/
-│   │   │   │   ├── popup/
-│   │   │   │   └── options/
-│   │   │   ├── core/
-│   │   │   │   ├── audio/
-│   │   │   │   │   ├── audio-capture.ts
-│   │   │   │   │   ├── pcm-capture.worklet.ts
-│   │   │   │   │   └── resampler.ts
-│   │   │   │   ├── engine/
-│   │   │   │   │   ├── local-engine-client.ts
-│   │   │   │   │   └── local-engine-protocol.ts
-│   │   │   │   ├── playback/
-│   │   │   │   │   ├── audio-player.ts
-│   │   │   │   │   ├── playback-scheduler.ts
-│   │   │   │   │   └── lag-manager.ts
-│   │   │   │   └── subtitles/
-│   │   │   │       └── subtitle-overlay.ts
-│   │   │   ├── messaging/
-│   │   │   │   ├── protocol.ts
-│   │   │   │   └── bridge.ts
-│   │   │   ├── store/
-│   │   │   │   ├── settings.ts
-│   │   │   │   └── state.ts
-│   │   │   └── lib/
-│   │   ├── package.json
-│   │   └── wxt.config.ts
-│   └── local-ai-server/
-│       ├── src/
-│       │   ├── main.py
-│       │   ├── config.py
-│       │   ├── ws/
-│       │   │   ├── gateway.py
-│       │   │   └── session.py
-│       │   ├── pipeline/
-│       │   │   ├── audio_buffer.py
-│       │   │   ├── vad_segmenter.py
-│       │   │   ├── asr_pipeline.py
-│       │   │   ├── translation_pipeline.py
-│       │   │   ├── tts_pipeline.py
-│       │   │   └── sync_metadata.py
-│       │   ├── providers/
-│       │   │   ├── asr/
-│       │   │   │   └── funasr_engine.py
-│       │   │   ├── mt/
-│       │   │   │   ├── argos_engine.py
-│       │   │   │   ├── libretranslate_engine.py
-│       │   │   │   └── ctranslate2_engine.py
-│       │   │   └── tts/
-│       │   │       ├── cosyvoice_engine.py
-│       │   │       └── piper_engine.py
-│       │   └── utils/
-│       │       ├── audio.py
-│       │       ├── logging.py
-│       │       └── timestamps.py
-│       ├── pyproject.toml
-│       └── README.md
+│   │   │   ├── main.py
+│   │   │   ├── config.py
+│   │   │   ├── ws/
+│   │   │   ├── providers/
+│   │   │   ├── pipeline/
+│   │   │   └── utils/
+│   │   ├── scripts/
+│   │   └── tests/
+│   └── models/mt/               # Git LFS 跟踪的 MT fallback
+├── models/                      # 用户下载的本地模型，默认忽略
 ├── packages/
 │   ├── protocol/
-│   │   └── src/
-│   │       ├── extension.ts
-│   │       └── local-engine.ts
 │   └── audio/
-│       └── src/
-│           ├── pcm.ts
-│           ├── wav.ts
-│           └── resample.ts
-├── models/
-│   ├── asr/
-│   ├── mt/
-│   └── tts/
 ├── docs/
-│   ├── architecture.md
-│   ├── local-deployment.md
-│   ├── model-selection.md
-│   ├── latency-budget.md
-│   └── privacy.md
 ├── infra/
-│   ├── docker/
-│   └── scripts/
-├── ARCHITECTURE.md
-└── README.md
+├── package.json
+└── wxt.config.ts
 ```
 
----
+### 4.1 当前事实来源
 
-## 12. 设置项设计
+| 主题 | 当前事实来源 |
+|---|---|
+| 扩展 Manifest 与构建输出 | `wxt.config.ts` |
+| 扩展设置与默认值 | `apps/extension/src/core/types.ts` |
+| 扩展内部消息 | `apps/extension/src/messaging/protocol.ts` |
+| 扩展使用的服务协议类型 | `apps/extension/src/core/engine/local-engine-protocol.ts` |
+| 服务端协议行为 | `apps/local-ai-server/src/ws/session.py` |
+| 完整协议说明 | `docs/local-engine-protocol.md` |
+| 本地模型默认路径 | `apps/local-ai-server/src/config.py` |
 
-```ts
-interface Settings {
-  enabled: boolean;
-  localEngineUrl: string;      // 默认 ws://127.0.0.1:8765/ws
-  localEngineToken?: string;
-  sourceLang: string;          // 默认 en
-  targetLang: string;          // 默认 zh
-  asrProvider: 'funasr';
-  mtProvider: 'argos' | 'libretranslate' | 'ctranslate2';
-  ttsProvider: 'cosyvoice' | 'piper';
-  latencyMode: 'low-latency' | 'sync-first';
-  playbackBufferMs: number;    // 默认 1500-3000
-  lagDropMs: number;           // 默认 4000-6000
-  showSubtitles: boolean;
-  showOriginalText: boolean;
-  debugLogging: boolean;
-}
-```
+`packages/protocol/src/local-engine.ts` 是正在收敛的共享协议定义，但当前扩展没有导入它。任何协议变更必须同步检查扩展内部类型、共享包、服务端解析和协议文档，直到完成单一事实来源迁移。
 
----
+## 5. 浏览器扩展架构
 
-## 13. 运行状态设计
+### 5.1 Manifest 与权限
 
-```ts
-interface RuntimeStatus {
-  state:
-    | 'idle'
-    | 'checking-engine'
-    | 'engine-offline'
-    | 'loading-models'
-    | 'ready'
-    | 'capturing'
-    | 'streaming'
-    | 'playing'
-    | 'paused'
-    | 'error';
-  engineConnected: boolean;
-  currentTabId?: number;
-  sourceLang: string;
-  targetLang: string;
-  lagMs: number;
-  queueDepth: number;
-  asrText?: string;
-  translatedText?: string;
-  error?: string;
-}
-```
-
----
-
-## 14. 开发路线图
-
-### P0：架构迁移
-
-目标：把当前工程从“浏览器内 AI 推理”调整为“扩展 + 本地 AI 服务”。
-
-验收：
-
-- `ARCHITECTURE.md` 更新为本文档路线。
-- 新增 `local-ai-server` 骨架。
-- 新增扩展到本地服务的协议定义。
-- 移除或隔离旧 Whisper/opus-mt 浏览器内推理主路径。
-
-### P1：扩展音频捕获
-
-目标：扩展能稳定捕获网页视频 PCM。
-
-验收：
-
-- YouTube/Bilibili 普通视频可捕获音频。
-- 原声可静音或不外放。
-- Offscreen 能收到连续 16kHz mono PCM。
-- 页面显示基础字幕浮层。
-
-### P2：本地服务连通
-
-目标：扩展与本地服务通过 WebSocket 通信。
-
-验收：
-
-- 本地服务启动后 popup 显示 connected。
-- 扩展能发送音频 chunk。
-- 本地服务能回传测试文本和测试音频。
-- Offscreen 能播放服务返回的测试音频。
-
-### P3：FunASR 实时识别
-
-目标：接入 FunASR。
-
-验收：
-
-- 英文视频可实时输出 ASR partial/final。
-- 字幕浮层显示英文识别文本。
-- VAD 能正确切分话语。
-
-### P4：本地翻译
-
-目标：接入 Argos 或 CTranslate2。
-
-验收：
-
-- ASR final 自动翻译为中文。
-- 字幕浮层显示中英双语。
-- 翻译延迟可观测。
-
-### P5：本地 TTS 与播放同步
-
-目标：接入 CosyVoice/Piper，并由扩展播放目标语言音频。
-
-验收：
-
-- 原视频静音。
-- 能听到中文译文语音。
-- 端到端延迟控制在 2-5 秒内。
-- 队列过长时能背压丢弃旧段。
-
-### P6：产品化
-
-目标：提升稳定性与可用性。
-
-验收：
-
-- 模型下载/检测流程可视化。
-- 本地服务 token 鉴权。
-- 多语言配置。
-- 自动重连。
-- 错误提示清晰。
-- 支持常见视频网站。
-
----
-
-## 15. 风险与限制
-
-1. 实时同传无法做到零延迟，必须接受 2-5 秒左右落后。
-2. FunASR、本地翻译、TTS 的语言覆盖并不完全一致，“任意语言”需要逐个模型支持。
-3. 本地部署对用户机器性能有要求，CPU 模式延迟更高。
-4. DRM 视频和受保护内容不支持。
-5. 网页播放器差异很大，`createMediaElementSource` 不一定在所有网站可用。
-6. TTS 音频长度可能与原语音长度差异较大，需要语速调整和背压策略。
-7. 本地服务要处理模型下载、显存不足、进程崩溃、端口占用等问题。
-8. 若未来发布到 Chrome Web Store，需要清晰说明音频捕获、隐私与本地处理逻辑。
-
----
-
-## 16. 当前工程可继承资产
-
-当前工程中值得保留或迁移的设计：
-
-- WXT + TypeScript + React 的扩展工程基础。
-- `background/content/offscreen/popup/options` 的入口划分。
-- Service Worker 管理 offscreen 生命周期的方式。
-- `PING_READY/OFFSCREEN_READY` 形式的 offscreen 就绪握手。
-- Content Script 中通过 Web Audio 接管 `<video>` 的音频捕获方式。
-- AudioWorklet 中 48kHz 到 16kHz 的实时降采样思路。
-- 类型化消息协议与 bridge 封装。
-- 设置存储与运行状态缓存。
-- 字幕 overlay 基础实现。
-- TTS 队列、lag、背压这些同步控制思想。
-
-需要替换或下线的部分：
-
-- 浏览器内 Whisper 推理主路径。
-- 浏览器内 opus-mt 推理主路径。
-- WebGPU/ONNX Runtime Web 作为主 AI 推理路径。
-- `speechSynthesis` 作为主 TTS 播放路径。
-- 当前 worker stub 逻辑。
-
----
-
-## 17. 推荐 MVP 组合
-
-第一版建议收敛为：
+扩展由根目录 WXT 工程构建：
 
 ```text
-Extension:
-  WXT + TypeScript + React + MV3
-  Content Script + AudioWorklet 捕获 16k mono PCM
-  Offscreen WebSocket 连接本地服务
-  Web Audio 播放本地 TTS 音频
-
-Local AI Engine:
-  Python + FastAPI + WebSocket
-  ASR: FunASR
-  VAD: FunASR FSMN-VAD
-  MT: Argos Translate
-  TTS: Piper 或 CosyVoice
-
-Target:
-  English video -> Chinese voice
-  Non-DRM websites first
-  2-5s end-to-end latency
+srcDir: apps/extension/src
+outDir: dist/extension
 ```
 
-该组合优先保证可运行、免费、本地、隐私安全。后续再扩展多语种、高质量 TTS、CTranslate2/NLLB、GPU 加速和桌面 companion app。
+当前权限：
+
+| 权限 | 用途 |
+|---|---|
+| `offscreen` | 创建持久媒体宿主 |
+| `storage` | 保存设置 |
+| `scripting` | 必要时补注入 Content Script |
+| `activeTab` | 操作当前活动标签页 |
+| `tabCapture` | 获取标签页音频 stream ID |
+
+Host permissions 当前包含 `<all_urls>` 及 `127.0.0.1:8765` / `localhost:8765` 的 HTTP、WebSocket 地址。
+
+### 5.2 Service Worker
+
+文件：`apps/extension/src/entrypoints/background.ts`
+
+职责：
+
+- 接收 Popup 的 `TOGGLE`。
+- 通过 `chrome.storage.local` 持久化 `enabled`。
+- 查询当前活动标签页。
+- 调用 `chrome.tabCapture.getMediaStreamId` 获取一次性 stream ID。
+- 创建或复用 Offscreen Document，并执行 ready/ping 握手。
+- 向 Offscreen 发送 `START_PIPELINE` / `STOP_PIPELINE`。
+- 向 Content Script 发送 `START_CAPTURE` / `STOP_CAPTURE`。
+- Content Script 不存在时通过 `chrome.scripting.executeScript` 补注入。
+- 保存当前内存状态并向 Popup 广播。
+
+Service Worker 不处理 PCM、不加载模型，也不持有 WebSocket。这符合 MV3 Service Worker 会被回收的运行特性。
+
+### 5.3 Offscreen Document
+
+文件：`apps/extension/src/entrypoints/offscreen/main.ts`
+
+Offscreen 是当前浏览器侧数据面的核心：
+
+- 使用 stream ID 调用 `navigator.mediaDevices.getUserMedia`。
+- 创建 `AudioContext`、MediaStreamSource 和 AudioWorkletNode。
+- 收取 30 ms Float32 PCM 帧。
+- 统计 chunks、bytes、duration、RMS、Peak。
+- 累积约 7 秒音频。
+- 连接本地 WebSocket 服务。
+- 将每段拆成 200 ms `audio.chunk`。
+- 接收 ASR / MT 结果。
+- 把双语文本通过运行时 Port 发给 Content Script。
+- WebSocket 断开后每 2 秒重连。
+
+Offscreen 使用静音 GainNode 连接到 `ctx.destination`，确保 AudioWorklet 持续被拉取，但不把捕获到的原声重新播放出来。
+
+### 5.4 AudioWorklet
+
+运行文件：`apps/extension/src/public/voxflow-pcm-capture.worklet.js`
+
+加载辅助：`apps/extension/src/core/audio/pcm-capture.worklet.ts`
+
+当前处理：
+
+1. 对输入通道求平均，得到 mono。
+2. 使用线性插值从实际 AudioContext 采样率重采样到 16 kHz。
+3. 每 480 samples 生成一帧，即 30 ms。
+4. 计算该帧 RMS 与 Peak。
+5. 通过 transferable `ArrayBuffer` 发送给 Offscreen 主线程。
+
+输出固定为：
+
+```text
+sampleRate: 16000 Hz
+channels: 1
+sampleFormat: Float32 / f32le
+frameSize: 480 samples
+frameDuration: 30 ms
+```
+
+当前 Worklet 使用普通数组和 `splice` 维护缓冲，功能正确但会产生复制与 GC 压力。后续应改为环形缓冲。
+
+### 5.5 Content Script
+
+文件：`apps/extension/src/entrypoints/content.ts`
+
+当前职责：
+
+- 在 `<all_urls>`、`document_idle` 注入。
+- 创建和更新 `SubtitleOverlay`。
+- 建立名为 `voxflow:pcm` 的 Runtime Port。
+- 每 250 ms读取页面首个 `<video>` 的 `currentTime`、暂停状态和倍速。
+- 接收 Offscreen 发来的 `SUBTITLE`。
+
+名称为 `voxflow:pcm` 的 Port 是早期设计遗留。当前 `chrome.tabCapture` 主路径中的 PCM 不经过 Content Script；PCM 直接在 Offscreen 内产生和处理。这个 Port 实际只承载 ready、视频时间和字幕消息，后续应重命名以反映职责。
+
+Content Script 上报的 `VIDEO_TIME` 当前在 Offscreen 中被接收但丢弃，尚未进入 `media.state` 或播放同步逻辑。
+
+### 5.6 Popup、Options 与存储
+
+Popup：
+
+- 切换 Start / Stop。
+- 显示运行状态。
+- 显示 chunks、bytes、音频时长、RMS、Peak 和采样率。
+- 显示错误。
+
+Options 当前只开放：
+
+- Local engine URL。
+- 英文源语言。
+- 简体中文目标语言。
+
+`Settings` 中还定义了 token、provider、延迟模式、播放缓冲、丢弃阈值和字幕选项，但多数尚未暴露或进入有效运行逻辑。
+
+设置保存在：
+
+```text
+chrome.storage.local["voxflow:settings"]
+```
+
+运行状态当前只保存在 Service Worker 内存中。Service Worker 被回收后，状态可能重置；这也是未来需要做状态恢复的原因。
+
+## 6. 启动与停止时序
+
+### 6.1 Start
+
+```mermaid
+sequenceDiagram
+  actor User as 用户
+  participant Popup
+  participant SW as Service Worker
+  participant Chrome as chrome.tabCapture
+  participant OD as Offscreen
+  participant CS as Content Script
+  participant Engine as Local Engine
+
+  User->>Popup: 点击 Start
+  Popup->>SW: TOGGLE(on=true)
+  SW->>SW: 保存 enabled=true
+  SW->>Chrome: getMediaStreamId(activeTab)
+  Chrome-->>SW: streamId
+  SW->>OD: ensure/create + PING_READY
+  OD-->>SW: OFFSCREEN_READY
+  SW->>OD: START_PIPELINE(settings, tabId, streamId)
+  par 数据面准备
+    OD->>Chrome: getUserMedia(streamId)
+    OD->>Engine: WebSocket connect
+  and 页面展示准备
+    SW->>CS: START_CAPTURE
+    CS->>CS: 创建 SubtitleOverlay
+    CS->>OD: Runtime Port READY
+  end
+  OD-->>Popup: PIPELINE_STATUS
+```
+
+注意：当前实现先向 Offscreen 启动管线，再让 Content Script 创建浮层。即使 Content Script 注入失败，Offscreen 仍可能已经开始采集。
+
+### 6.2 Stop
+
+```mermaid
+sequenceDiagram
+  actor User as 用户
+  participant Popup
+  participant SW as Service Worker
+  participant OD as Offscreen
+  participant CS as Content Script
+
+  User->>Popup: 点击 Stop
+  Popup->>SW: TOGGLE(on=false)
+  SW->>OD: STOP_PIPELINE
+  OD->>OD: 停止 MediaStream / AudioContext / WebSocket
+  SW->>CS: STOP_CAPTURE
+  CS->>CS: 断开 Port 并移除浮层
+  SW->>SW: resetStatus()
+```
+
+Offscreen Document 本身不会在每次 Stop 时关闭，只停止内部资源，供后续快速复用。
+
+## 7. 音频数据路径
+
+### 7.1 浏览器内采集
+
+```mermaid
+flowchart TD
+  Tab["标签页最终混音"] --> Stream["tabCapture MediaStream"]
+  Stream --> Context["AudioContext ≈ 48 kHz"]
+  Context --> Worklet["AudioWorklet"]
+  Worklet --> Mono["通道平均"]
+  Mono --> Resample["线性插值重采样"]
+  Resample --> Frame["16 kHz / 30 ms / Float32"]
+  Frame --> Stats["RMS + Peak"]
+  Frame --> Segment["Offscreen segment buffer"]
+```
+
+常量位于 Offscreen：
+
+| 常量 | 当前值 | 含义 |
+|---|---:|---|
+| `SEGMENT_MS` | 7000 ms | 达到后提交一个推理段 |
+| `MIN_SEGMENT_MS` | 1200 ms | 最短可提交段 |
+| `MAX_SEGMENT_MS` | 12000 ms | 引擎离线时只保留最近音频上限 |
+| `ENGINE_CHUNK_MS` | 200 ms | 向服务端发送的协议分包大小 |
+| `ENGINE_RECONNECT_MS` | 2000 ms | WebSocket 重连周期 |
+
+当前固定 7 秒分段是首条字幕延迟的最大来源。30 ms Worklet 帧和 200 ms 传输包并不等于流式 ASR，因为服务端只有在收到 `audio.end` 后才开始整段推理。
+
+### 7.2 传输编码
+
+扩展会：
+
+1. 合并 7 秒 Float32Array。
+2. 按 200 ms 切片。
+3. 直接读取小端 Float32 的字节视图。
+4. Base64 编码。
+5. 放进 JSON `audio.data`。
+6. 以 WebSocket text frame 发送。
+
+标称音频数据率：
+
+```text
+16000 samples/s × 4 bytes = 64 KB/s raw PCM
+Base64 后约 85 KB/s，不含 JSON envelope
+```
+
+当前协议简单易调试，但编码、内存复制和 JSON 解析开销较高。二进制 WebSocket 帧是明确的后续优化方向。
+
+### 7.3 原声行为
+
+`tabCapture` 取得标签页音频后，当前只连接到增益为 0 的输出，因此原声不会继续外放。这符合未来“译文语音替代原声”的方向，但在 TTS 尚未实现的当前版本中，Start 后用户只会看到双语文本。
+
+## 8. 本地 AI 服务架构
+
+### 8.1 进程入口与配置
+
+入口：
+
+```bash
+python -m src.main --host 127.0.0.1 --port 8765
+```
+
+默认配置：
+
+| 项目 | 默认值 |
+|---|---|
+| Host | `127.0.0.1` |
+| Port | `8765` |
+| WebSocket Path | `/ws` |
+| ASR Model | `models/asr/SenseVoiceSmall` |
+| ASR Language | `en` |
+| MT Model | `models/mt`，不存在则 `apps/models/mt` |
+
+### 8.2 WebSocket Gateway
+
+文件：`apps/local-ai-server/src/ws/gateway.py`
+
+网关使用 Python 标准库实现：
+
+- `asyncio.start_server` 接收 TCP 连接。
+- 手工处理 HTTP Upgrade。
+- 接收 masked WebSocket text frame。
+- 每个 TCP / WebSocket 连接创建一个 `LocalEngineSession`。
+- 最大 WebSocket frame 为 2 MiB。
+- 未实现扩展帧、压缩、ping/pong 管理和完整 RFC 边界能力。
+- 所有 AI 启动与 finalize 任务通过全局 `AI_PIPELINE_LOCK` 串行。
+- 阻塞模型调用通过 `asyncio.to_thread` 移出事件循环。
+
+这是适合 MVP 的最小实现，不适合作为公网或多租户网关。
+
+### 8.3 Session 生命周期
+
+文件：`apps/local-ai-server/src/ws/session.py`
+
+每个连接当前只维护一个可重置的 `LocalEngineSession`：
+
+```mermaid
+stateDiagram-v2
+  [*] --> Empty
+  Empty --> Ready: session.start
+  Ready --> Receiving: audio.chunk seq=0
+  Receiving --> Receiving: audio.chunk seq=n+1
+  Receiving --> Finalizing: audio.end
+  Finalizing --> Finalized: ASR / MT / result.final
+  Finalized --> Ready: 下一次 session.start 重置
+  Ready --> Finalized: session.cancel / session.close
+```
+
+服务端验证：
+
+- 协议版本必须为 `voxflow.local.v1`。
+- `asr` 是 MT / TTS 的前置阶段。
+- 当前 MT 只接受英文源语言与简体中文目标语言。
+- 当前只接受单声道。
+- 同一 session 不能改变 sample rate、channels 或 sample format。
+- chunk `seq` 必须从 0 连续递增。
+- 单个解码后 chunk 最大 1 MiB。
+- 单 session 最长 120 秒。
+- 支持 `f32le` 和 `pcm16le` 输入，内部归一为 `f32le`。
+
+扩展当前每个约 7 秒段创建新的 `sessionId`，在同一 WebSocket 连接上依次执行 `session.start → audio.chunk* → audio.end`。
+
+### 8.4 ASR Provider
+
+文件：`apps/local-ai-server/src/providers/asr/funasr_engine.py`
+
+当前流程：
+
+1. `session.start` 根据 model、language、device 取得 FunASR engine。
+2. Engine 以 `(model, language, device)` 为键进行进程内缓存。
+3. `audio.end` 时把内存中的 f32le 转成 PCM16。
+4. 写入临时 WAV。
+5. 调用 `AutoModel.generate`。
+6. 清理 SenseVoice 输出中的 `<|...|>` 标记。
+7. 在 `finally` 中删除临时 WAV。
+
+当前默认 `device="cpu"`。虽然协议允许 `cuda` 和 `mps`，扩展 UI 没有设备选择，服务也没有自动设备探测。
+
+当前 `merge_vad=True` 只作为 FunASR generate 参数传入；没有显式加载 `vad_model`，也没有实现持续流式 VAD 分段。因此不能把它视为已经接入 FSMN-VAD。
+
+### 8.5 Translation Pipeline
+
+文件：`apps/local-ai-server/src/pipeline/translation_pipeline.py`
+
+当前使用：
+
+- `MarianTokenizer`
+- `MarianMTModel`
+- PyTorch `inference_mode`
+- `Helsinki-NLP/opus-mt-en-zh` 本地目录
+
+模型在首次翻译时惰性加载，并以进程级单例缓存。翻译调用使用线程锁保护。
+
+MT provider 设置虽然允许 `huggingface`、`argos`、`libretranslate` 和 `ctranslate2`，当前 Session 并不会按 provider 分派；无论扩展传入哪个允许值，实际都进入 Hugging Face MarianMT 管线。`argos_engine.py` 只是兼容导出，LibreTranslate 与 CTranslate2 仍是占位文件。
+
+### 8.6 当前并发模型
+
+```mermaid
+flowchart TD
+  C1["WebSocket Client 1"] --> G["Gateway"]
+  C2["WebSocket Client 2"] --> G
+  G --> L["全局 AI_PIPELINE_LOCK"]
+  L --> Start["Model load / session.start"]
+  L --> Finalize["ASR + MT / audio.end"]
+```
+
+`audio.chunk` 的 Base64 解码与缓冲不经过 AI 锁；模型加载和 finalize 经过全局锁。这可以降低当前模型线程安全风险，但多个客户端会互相等待，且没有队列深度、超时或取消正在执行推理的能力。
+
+## 9. `voxflow.local.v1` 协议
+
+默认端点：
+
+```text
+ws://127.0.0.1:8765/ws
+```
+
+### 9.1 客户端消息
+
+| 类型 | 当前用途 |
+|---|---|
+| `session.start` | 声明 stages、模型参数与输入音频格式 |
+| `audio.chunk` | 发送连续 Base64 PCM 包 |
+| `audio.end` | 完成当前段并触发 ASR / MT |
+| `media.state` | 协议支持，服务当前忽略 |
+| `session.cancel` | 清空当前缓冲并停止 |
+| `session.close` | 当前等价于 cancel |
+
+### 9.2 服务端事件
+
+| 类型 | 当前状态 |
+|---|---|
+| `session.started` | 已实现 |
+| `engine.status` | 已实现 |
+| `audio.stats` | 已实现，每个 chunk 返回一次 |
+| `asr.final` | 已实现 |
+| `mt.final` | 已实现 |
+| `result.final(kind=asr/text)` | 已实现 |
+| `tts.audio` / `tts.final` | 类型预留，当前不产生 |
+| `error` | 已实现 |
+
+### 9.3 管线行为
+
+| `pipeline.stages` | 结果 |
+|---|---|
+| `["asr"]` | `asr.final` + `result.final(kind=asr)` |
+| `["asr", "mt"]` | `asr.final` + `mt.final` + `result.final(kind=text)` |
+| 包含 `tts` | 非恢复错误 `tts_unavailable` |
+
+完整 envelope、字段、校验和示例参见 [docs/local-engine-protocol.md](docs/local-engine-protocol.md)。
+
+## 10. 内部消息与状态流
+
+### 10.1 控制消息
+
+`apps/extension/src/messaging/protocol.ts` 定义：
+
+```text
+TOGGLE
+GET_STATUS
+GET_SETTINGS
+UPDATE_SETTINGS
+REQUEST_CAPTURE
+START_PIPELINE
+STOP_PIPELINE
+PING_READY
+OFFSCREEN_READY
+PIPELINE_STATUS
+STATUS
+```
+
+控制消息经 `chrome.runtime.sendMessage` 传递。异步错误被包装为 `__voxflowError`，调用端再恢复为 Error。
+
+### 10.2 Runtime Port
+
+Content Script 和 Offscreen 使用长连接 Port：
+
+```text
+name: voxflow:pcm
+messages: READY / PCM / VIDEO_TIME / SUBTITLE / END
+```
+
+当前主路径实际只使用 `READY`、`VIDEO_TIME` 和 `SUBTITLE`。`PCM` 是旧的页面采集路径遗留。
+
+### 10.3 状态机
+
+运行状态类型：
+
+```text
+idle
+checking-engine
+engine-offline
+loading-models
+ready
+capturing
+streaming
+playing
+paused
+error
+```
+
+当前实际常见路径：
+
+```text
+idle → checking-engine → capturing / ready → streaming
+                         ↘ engine-offline
+                         ↘ error
+streaming → idle
+```
+
+`loading-models`、`playing` 和 `paused` 已定义但当前没有完整状态转移。
+
+## 11. 模型与文件布局
+
+### 11.1 ASR
+
+默认路径：
+
+```text
+models/asr/SenseVoiceSmall/
+├── config.yaml
+├── model.pt
+└── ...
+```
+
+`models/**` 默认被 `.gitignore` 忽略，只保留 `.gitkeep`。ASR 模型需要用户下载，不进入 Git。
+
+### 11.2 MT
+
+优先路径：
+
+```text
+models/mt
+```
+
+回退路径：
+
+```text
+apps/models/mt
+```
+
+`apps/models/mt` 的大权重由 Git LFS 跟踪。当前运行只需要 PyTorch 权重与 tokenizer / config 文件，TensorFlow、Flax 和 Rust 权重不参与推理。
+
+### 11.3 TTS
+
+预留路径：
+
+```text
+models/tts
+```
+
+当前没有模型下载器、provider 实现或运行时加载。
+
+## 12. 隐私与安全
+
+### 12.1 当前已做到
+
+- 服务默认绑定 `127.0.0.1`。
+- 扩展默认连接 `ws://127.0.0.1:8765/ws`。
+- 推理完成后不保存长期音频文件。
+- ASR 临时 WAV 在 `finally` 中删除。
+- 模型准备完成后，ASR / MT 推理不要求云端 API。
+- 默认没有云端 API Key。
+
+### 12.2 当前缺口
+
+| 项目 | 当前状态 | 风险 |
+|---|---|---|
+| Token 校验 | 客户端能带 query token，服务端不校验 | 本机其他进程或页面可尝试连接 |
+| Origin 校验 | 未实现 | 恶意网页可能尝试访问本地 WebSocket |
+| TLS | 未实现 | 只适合回环地址 |
+| 健康检查 | 未实现 | 无法区分端口已监听与模型已就绪 |
+| 能力协商 | 未实现 | 客户端只能通过请求失败发现不支持能力 |
+| 请求速率限制 | 未实现 | 本地端口可能被滥用 |
+| 结构化日志与脱敏 | 未实现 | 当前主要使用 print / 异常消息 |
+
+因此必须保持默认回环绑定。当前版本不应直接绑定 `0.0.0.0`，也不应暴露到公网。
+
+### 12.3 建议的安全演进顺序
+
+1. 校验 `Origin`，只允许已知扩展来源。
+2. 首次启动生成本地随机 token。
+3. 扩展通过 query 或首帧认证。
+4. 增加 `/health` 或 `engine.capabilities`。
+5. 增加连接数、消息大小、速率和 session 时长限制。
+6. 仅在明确的远程部署模式下引入 TLS。
+
+## 13. 性能与延迟
+
+### 13.1 当前延迟组成
+
+```text
+首条译文延迟
+≈ 固定 7 秒采集
+ + ASR 冷启动 / 热推理
+ + MT 冷启动 / 热推理
+ + 协议和 UI 开销
+```
+
+当前最大结构性延迟是固定分段，而不是 localhost WebSocket。
+
+### 13.2 当前性能瓶颈
+
+- 固定 7 秒后才调用整段 ASR。
+- Float32 + Base64 + JSON 增加约 33% 编码体积。
+- Worklet 普通数组 `splice` 会移动内存。
+- ASR 每段写临时 WAV。
+- 每个 audio chunk 都返回 `audio.stats`。
+- AI 全局锁将所有客户端串行化。
+- MT 使用通用 Transformers / PyTorch，尚未量化或转换 CTranslate2。
+- 冷启动没有显式预热。
+
+### 13.3 优化优先级
+
+1. 服务端 VAD 和自然语音分段。
+2. 流式或增量 ASR，产生 `asr.partial`。
+3. 模型预热和 readiness / capabilities。
+4. Worklet 环形缓冲与更少复制。
+5. 二进制 WebSocket 帧。
+6. `audio.stats` 聚合采样。
+7. 直接 waveform 推理，避免临时 WAV。
+8. MarianMT → CTranslate2 / 量化。
+9. 显式任务队列、取消和背压。
+10. TTS 首包流式返回与浏览器播放调度。
+
+更完整的分析见 [docs/performance-optimization.md](docs/performance-optimization.md)。
+
+## 14. TTS 与同步目标设计
+
+本节是目标设计，不是当前能力。
+
+### 14.1 目标管线
+
+```mermaid
+flowchart LR
+  PCM["连续 PCM"] --> VAD["VAD"]
+  VAD --> ASR["Streaming ASR"]
+  ASR --> Stable["文本稳定 / 分句"]
+  Stable --> MT["上下文翻译"]
+  MT --> Normalize["TTS 文本规范化"]
+  Normalize --> TTS["Piper / CosyVoice"]
+  TTS --> Queue["时间戳播放队列"]
+  Queue --> Player["Offscreen Web Audio"]
+```
+
+### 14.2 时间戳
+
+未来每个 TTS 音频包需要携带：
+
+```text
+segmentId
+sourceStartMs
+sourceEndMs
+audio duration
+sequence number
+```
+
+Content Script 上报的 `video.currentTime` 应转换为 `media.state` 送入本地服务或交给 Offscreen Scheduler。播放队列根据当前媒体时间计算 lag。
+
+### 14.3 背压
+
+必须避免直播场景越看越落后：
+
+- 队列 lag 超过阈值时进入追赶状态。
+- 优先丢弃过旧或低价值片段。
+- 必要时只保留最新完整句。
+- 在自然静音间隙追赶。
+- UI 显示 lag、queue depth 和丢弃事件。
+
+现有 `playbackBufferMs=2000`、`lagDropMs=5000` 只是设置预留，当前没有执行这些策略。
+
+## 15. 测试与验证
+
+### 15.1 当前自动检查
+
+TypeScript：
+
+```bash
+npm run compile
+npm run build
+```
+
+Python Session 单元测试：
+
+```bash
+cd apps/local-ai-server
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+单元测试当前覆盖：
+
+- ASR + MT final 事件。
+- 音频 seq 顺序校验。
+- 空音频错误。
+- FunASR 加载失败。
+- TTS 未实现时的明确错误。
+
+### 15.2 终端端到端验证
+
+```bash
+cd apps/local-ai-server
+.venv/bin/python scripts/realtime_client.py \
+  --wav tmp/hello.wav \
+  --stages asr,mt
+```
+
+这个客户端验证真实 WebSocket 握手、模型加载、音频分包、ASR、MT 和 final 事件。
+
+### 15.3 当前测试缺口
+
+- 没有扩展单元测试。
+- 没有浏览器 E2E。
+- 没有网关协议模糊测试。
+- 没有多连接并发测试。
+- 没有性能基准与冷 / 热启动指标。
+- 没有跨平台安装验证矩阵。
+- 没有 DRM / 非 DRM 网站兼容性矩阵。
+
+## 16. 架构决策
+
+### ADR-001：模型运行在本地 Python 服务
+
+选择：
+
+- 扩展只做浏览器能力。
+- ASR / MT / TTS 放在本地服务。
+
+原因：
+
+- Python 模型生态成熟。
+- 避免 MV3 CSP、Service Worker 生命周期与扩展内存限制。
+- 模型下载、缓存、GPU 和日志更容易管理。
+
+代价：
+
+- 用户需要安装 Python 环境并启动伴随服务。
+- 需要维护浏览器与服务之间的版本协议。
+
+### ADR-002：使用 `chrome.tabCapture` 作为主捕获路径
+
+原因：
+
+- 捕获标签页最终音频。
+- 避免页面已经调用 `createMediaElementSource` 的冲突。
+- 对复杂播放器比 DOM media element 接管更稳健。
+
+代价：
+
+- Chromium 特有。
+- 需要用户手势和活动标签页。
+- 当前接管后原声不再外放。
+- DRM 内容仍不支持。
+
+`core/audio/audio-capture.ts` 中保留的 MediaElementSource 捕获实现当前不在主路径。
+
+### ADR-003：Offscreen 承载浏览器数据面
+
+原因：
+
+- Service Worker 不适合 Web Audio 和长连接。
+- Content Script 随页面生命周期变化。
+- Offscreen 能持有 AudioContext、WebSocket 与后续播放器。
+
+代价：
+
+- 增加跨执行环境消息与生命周期协调。
+- 状态恢复更复杂。
+
+### ADR-004：MVP 使用 JSON + Base64
+
+原因：
+
+- 协议可读、可记录、终端客户端易实现。
+- 先验证端到端语义。
+
+代价：
+
+- 体积与 CPU 开销较高。
+- 后续需要迁移二进制帧并设计兼容策略。
+
+### ADR-005：MVP 使用标准库 WebSocket 网关
+
+原因：
+
+- 避免额外 Web 框架依赖。
+- 足以支撑单机协议验证。
+
+代价：
+
+- RFC 完整性、安全、健康检查和可观测性有限。
+- 产品化时可能迁移到成熟 WebSocket / ASGI 实现。
+
+## 17. 已知技术债
+
+按影响排序：
+
+1. 固定 7 秒分段导致高延迟。
+2. TTS 与播放完全未接入，但类型和设置容易让人误以为可用。
+3. 扩展协议类型和 `packages/protocol` 重复。
+4. `voxflow:pcm` Port 命名与当前职责不符。
+5. provider 设置与服务端实际 Hugging Face 固定实现不一致。
+6. `media.state` 和 `VIDEO_TIME` 尚未接通。
+7. Service Worker 内存状态不能可靠跨回收恢复。
+8. 本地服务缺少 token / Origin 校验。
+9. 模型冷启动没有 readiness 和预热机制。
+10. Worklet 缓冲和 Base64 路径复制较多。
+11. 共享 audio 包、VAD、TTS、sync、infra 中存在大量占位文件。
+12. 根目录缺少 CI、跨平台安装脚本和浏览器 E2E。
+
+## 18. 演进路线
+
+### P0：稳定当前文本链路
+
+- 统一协议单一事实来源。
+- 增加扩展消息和 Session 测试。
+- 明确 readiness、错误码和冷启动状态。
+- 增加模型完整性检查与下载脚本。
+- 完成本地 token 和 Origin 校验。
+
+### P1：降低首条字幕延迟
+
+- 接入 VAD。
+- 将固定 7 秒改为自然话语边界。
+- 支持 `asr.partial`。
+- 聚合 stats，减少协议噪声。
+- 建立延迟指标基线。
+
+### P2：优化本地推理
+
+- 避免临时 WAV。
+- 引入 CTranslate2 或量化 MT。
+- 增加 CPU / CUDA / MPS 设备选择。
+- 实现模型预热与能力协商。
+- 将 WebSocket 音频迁移为二进制帧。
+
+### P3：实现译文语音
+
+- 接入 Piper 轻量 TTS。
+- 评估 CosyVoice 高质量档位。
+- 实现 `tts.audio` / `tts.final`。
+- Offscreen AudioPlayer 播放服务端音频。
+
+### P4：同步与产品化
+
+- 接通 `VIDEO_TIME → media.state`。
+- 实现 PlaybackScheduler 与 LagManager。
+- 增加背压、追赶和丢弃策略。
+- 一键安装、模型管理和桌面伴随服务。
+- 建立 Chrome / Edge 与网站兼容矩阵。
+
+## 19. 变更架构时的检查清单
+
+修改扩展与服务边界时，至少检查：
+
+- `apps/extension/src/core/engine/local-engine-protocol.ts`
+- `packages/protocol/src/local-engine.ts`
+- `apps/local-ai-server/src/ws/session.py`
+- `apps/local-ai-server/scripts/realtime_client.py`
+- `apps/local-ai-server/tests/test_session.py`
+- `docs/local-engine-protocol.md`
+- 本文档与 `README.md`
+
+修改音频格式时，额外检查：
+
+- AudioWorklet 输出格式。
+- Offscreen 分段和 `encodeF32leBase64`。
+- `Session.normalize_audio_payload`。
+- sample rate、channels、frameCount 和 byteLength 校验。
+- 测试 WAV 与终端客户端。
+
+修改捕获生命周期时，额外检查：
+
+- 用户手势是否仍满足 `tabCapture` 要求。
+- Offscreen 是否 ready。
+- Start / Stop 是否释放 MediaStream track、AudioContext、Port 和 WebSocket。
+- Content Script 重复注入保护。
+- Service Worker 回收后的恢复行为。
+
+---
+
+当前架构的核心判断是：**浏览器扩展负责“拿到媒体并呈现体验”，本地服务负责“运行 AI”，版本化协议负责隔离两者。** 下一阶段的关键不是继续堆叠模型名称，而是先把固定分段升级为可观测、可背压的流式管线，再接入 TTS 与同步播放。
