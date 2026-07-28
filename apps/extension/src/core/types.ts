@@ -9,7 +9,7 @@ export interface Settings {
   sourceLang: LangCode;
   targetLang: LangCode;
   asrProvider: 'funasr';
-  mtProvider: 'argos' | 'libretranslate' | 'ctranslate2';
+  mtProvider: 'huggingface' | 'argos' | 'libretranslate' | 'ctranslate2';
   ttsProvider: 'cosyvoice' | 'piper';
   latencyMode: LatencyMode;
   playbackBufferMs: number;
@@ -26,7 +26,7 @@ export const DEFAULT_SETTINGS: Settings = {
   sourceLang: 'en',
   targetLang: 'zh',
   asrProvider: 'funasr',
-  mtProvider: 'argos',
+  mtProvider: 'huggingface',
   ttsProvider: 'piper',
   latencyMode: 'low-latency',
   playbackBufferMs: 2000,

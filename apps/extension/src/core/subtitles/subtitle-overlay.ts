@@ -5,6 +5,7 @@ const ROOT_ID = 'voxflow-subtitle-root';
 
 export class SubtitleOverlay {
   private root: HTMLDivElement | null = null;
+  private audioUrl: string | null = null;
 
   show(): void {
     if (this.root) return;
@@ -46,17 +47,21 @@ export class SubtitleOverlay {
     const audio = this.root?.querySelector<HTMLAudioElement>('.vf-audio');
     const download = this.root?.querySelector<HTMLAnchorElement>('.vf-download');
     if (container && audio && download) {
+      if (this.audioUrl) URL.revokeObjectURL(this.audioUrl);
       const url = URL.createObjectURL(blob);
+      this.audioUrl = url;
       audio.src = url;
       download.href = url;
       container.style.display = 'flex';
-      
+
       const hint = this.root?.querySelector<HTMLElement>('.vf-hint');
       if (hint) hint.textContent = 'Audio capture stopped. You can play or download the captured audio below.';
     }
   }
 
   remove(): void {
+    if (this.audioUrl) URL.revokeObjectURL(this.audioUrl);
+    this.audioUrl = null;
     this.root?.remove();
     this.root = null;
   }

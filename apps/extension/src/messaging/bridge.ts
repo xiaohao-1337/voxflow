@@ -1,7 +1,7 @@
 import type { ControlMessage, PcmPortMessage, TabMessage } from './protocol';
 
-export function sendControl(msg: ControlMessage): Promise<unknown> {
-  return chrome.runtime.sendMessage(msg);
+export async function sendControl(msg: ControlMessage): Promise<unknown> {
+  return unwrapResponse(await chrome.runtime.sendMessage(msg));
 }
 
 export function onControlMessage(
@@ -15,7 +15,7 @@ export function onControlMessage(
     if (!isProtocolMessage(msg)) return false;
     const result = handler(msg as ControlMessage, sender);
     if (result instanceof Promise) {
-      result.then(sendResponse, (error) => sendResponse({ error: serializeError(error) }));
+      result.then(sendResponse, (error) => sendResponse({ __voxflowError: serializeError(error) }));
       return true;
     }
     return false;
@@ -24,8 +24,8 @@ export function onControlMessage(
   return () => chrome.runtime.onMessage.removeListener(listener);
 }
 
-export function sendToTab(tabId: number, msg: TabMessage): Promise<unknown> {
-  return chrome.tabs.sendMessage(tabId, msg);
+export async function sendToTab(tabId: number, msg: TabMessage): Promise<unknown> {
+  return unwrapResponse(await chrome.tabs.sendMessage(tabId, msg));
 }
 
 export function onTabMessage(
@@ -39,7 +39,7 @@ export function onTabMessage(
     if (!isProtocolMessage(msg)) return false;
     const result = handler(msg as TabMessage, sender);
     if (result instanceof Promise) {
-      result.then(sendResponse, (error) => sendResponse({ error: serializeError(error) }));
+      result.then(sendResponse, (error) => sendResponse({ __voxflowError: serializeError(error) }));
       return true;
     }
     return false;
@@ -93,4 +93,16 @@ function isProtocolMessage(msg: unknown): msg is { kind: string } {
 function serializeError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
+}
+
+function unwrapResponse(response: unknown): unknown {
+  if (
+    response &&
+    typeof response === 'object' &&
+    '__voxflowError' in response &&
+    typeof (response as { __voxflowError?: unknown }).__voxflowError === 'string'
+  ) {
+    throw new Error((response as { __voxflowError: string }).__voxflowError);
+  }
+  return response;
 }

@@ -32,9 +32,3 @@ def f32le_stats(payload: bytes) -> dict[str, float | int]:
         "rms": math.sqrt(sum_sq / len(samples)),
         "peak": peak,
     }
-
-
-def pcm16_silence(duration_ms: int, sample_rate: int = 16000) -> bytes:
-    """Create a small silent PCM16 buffer for placeholder TTS output."""
-    samples = max(1, int(sample_rate * duration_ms / 1000))
-    return b"\x00\x00" * samples

@@ -74,7 +74,7 @@ export function App() {
       </section>
 
       <section className="note">
-        <strong>Current milestone:</strong> Chrome extension audio capture test. Local FunASR/MT/TTS services are placeholders.
+        <strong>Current milestone:</strong> Local FunASR recognition and English-to-Chinese text translation. Translated voice playback is planned.
       </section>
 
       {status.error && <section className="error">{status.error}</section>}

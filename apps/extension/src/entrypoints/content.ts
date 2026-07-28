@@ -5,15 +5,20 @@ import { PORT } from '../messaging/protocol';
 import { getSettings, onSettingsChanged } from '../store/settings';
 import { reportError } from '../lib/utils';
 
+const CONTENT_INSTANCE_KEY = '__voxflowContentScriptActive__';
+
 export default defineContentScript({
   matches: ['<all_urls>'],
   runAt: 'document_idle',
   main() {
+    const scope = globalThis as typeof globalThis & { [CONTENT_INSTANCE_KEY]?: boolean };
+    if (scope[CONTENT_INSTANCE_KEY]) return;
+    scope[CONTENT_INSTANCE_KEY] = true;
+
     let port: PcmPort | null = null;
     let overlay: SubtitleOverlay | null = null;
     let startPromise: Promise<void> | null = null;
     let videoTimer: number | null = null;
-    let seq = 0;
 
     onTabMessage((msg) => {
       if (msg.kind === 'START_CAPTURE') void start();
@@ -94,7 +99,6 @@ export default defineContentScript({
         // Ignore a disconnected port.
       }
       port = null;
-      seq = 0;
 
       if (removeOverlay) {
         overlay?.remove();

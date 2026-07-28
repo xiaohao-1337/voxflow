@@ -8,6 +8,7 @@ installed yet.
 from __future__ import annotations
 
 import tempfile
+import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,14 +34,19 @@ class FunAsrConfig:
 
 
 _ENGINE_CACHE: dict[tuple[str, str, str], "FunAsrEngine"] = {}
+_ENGINE_CACHE_LOCK = threading.Lock()
 
 
 def get_funasr_engine(config: FunAsrConfig) -> "FunAsrEngine":
     key = (config.model, config.language, config.device)
     engine = _ENGINE_CACHE.get(key)
-    if engine is None:
-        engine = FunAsrEngine(config)
-        _ENGINE_CACHE[key] = engine
+    if engine is not None:
+        return engine
+    with _ENGINE_CACHE_LOCK:
+        engine = _ENGINE_CACHE.get(key)
+        if engine is None:
+            engine = FunAsrEngine(config)
+            _ENGINE_CACHE[key] = engine
     return engine
 
 

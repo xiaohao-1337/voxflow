@@ -1,4 +1,4 @@
-"""A tiny stdlib-only WebSocket gateway for the local-engine smoke test."""
+"""Small stdlib WebSocket gateway for the VoxFlow local engine."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from src.config import DEFAULT_HOST, DEFAULT_PORT
 from src.ws.session import LocalEngineSession
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_FRAME_BYTES = 2 * 1024 * 1024
+AI_PIPELINE_LOCK = asyncio.Lock()
 
 
 class WebSocketClosed(Exception):
@@ -30,7 +32,7 @@ async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         path, headers = await read_http_upgrade(reader)
-        if path != "/ws":
+        if path.partition("?")[0] != "/ws":
             await write_http_error(writer, 404, "Not Found")
             return
         key = headers.get("sec-websocket-key")
@@ -49,33 +51,52 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         )
         await writer.drain()
         await handle_messages(reader, writer)
-    except WebSocketClosed:
+    except (WebSocketClosed, asyncio.IncompleteReadError, ConnectionResetError):
         pass
     except Exception as exc:  # pragma: no cover - smoke-test server logging
         print(f"client error: {exc}")
     finally:
         writer.close()
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionError):
+            pass
 
 
 async def handle_messages(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     session = LocalEngineSession()
     while True:
         message = await recv_json(reader)
-        events = dispatch(session, message)
+        try:
+            events = await dispatch(session, message)
+        except Exception as exc:
+            events = [session.error("bad_request", str(exc), recoverable=True)]
         for event in events:
             await send_json(writer, event)
 
 
-def dispatch(session: LocalEngineSession, message: dict[str, Any]) -> list[dict[str, Any]]:
+async def dispatch(session: LocalEngineSession, message: dict[str, Any]) -> list[dict[str, Any]]:
     msg_type = message.get("type")
     if msg_type == "session.start":
-        return session.start(message)
+        return await run_ai_task(session.start, message)
     if msg_type == "audio.chunk":
         return session.ingest_audio(message)
+    if msg_type == "audio.end":
+        return await run_ai_task(session.end_audio, message)
     if msg_type == "session.stop":
-        return session.stop()
-    return [{"type": "error", "sessionId": session.session_id, "code": "unknown_message", "message": str(msg_type)}]
+        return await run_ai_task(session.stop)
+    if msg_type == "session.cancel":
+        return session.cancel(message)
+    if msg_type == "session.close":
+        return session.cancel(message)
+    if msg_type == "media.state":
+        return []
+    return [session.error("unknown_message", str(msg_type), recoverable=True)]
+
+
+async def run_ai_task(function: Any, *args: Any) -> list[dict[str, Any]]:
+    async with AI_PIPELINE_LOCK:
+        return await asyncio.to_thread(function, *args)
 
 
 async def read_http_upgrade(reader: asyncio.StreamReader) -> tuple[str, dict[str, str]]:
@@ -130,6 +151,8 @@ async def recv_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
         length = struct.unpack("!H", await reader.readexactly(2))[0]
     elif length == 127:
         length = struct.unpack("!Q", await reader.readexactly(8))[0]
+    if length > MAX_FRAME_BYTES:
+        raise ValueError(f"WebSocket frame exceeds {MAX_FRAME_BYTES} bytes")
     mask = await reader.readexactly(4) if masked else b""
     payload = await reader.readexactly(length)
     if masked:

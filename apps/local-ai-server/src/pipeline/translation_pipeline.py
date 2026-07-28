@@ -1,44 +1,82 @@
-"""Translation pipeline using Hugging Face model loaded from local models directory."""
+"""Local English-to-Chinese translation backed by a Hugging Face model."""
 
-from pathlib import Path
+from __future__ import annotations
+
 import logging
-from transformers import MarianMTModel, MarianTokenizer
-from src.config import PROJECT_ROOT
+import threading
+from pathlib import Path
+from typing import Any
+
+from src.config import DEFAULT_MT_MODEL
 
 logger = logging.getLogger(__name__)
 
+
+class TranslationUnavailable(RuntimeError):
+    """Raised when the local translation model cannot be loaded."""
+
+
+class TranslationFailed(RuntimeError):
+    """Raised when local translation inference fails."""
+
+
 class HuggingFaceTranslationEngine:
-    def __init__(self, model_path: str | Path):
-        self.model_path = str(model_path)
-        logger.info(f"Initializing HF Translation Engine with model at {self.model_path}")
-        self.tokenizer = MarianTokenizer.from_pretrained(self.model_path)
-        self.model = MarianMTModel.from_pretrained(self.model_path)
+    def __init__(self, model_path: str | Path) -> None:
+        path = Path(model_path)
+        if not path.is_dir():
+            raise TranslationUnavailable(f"Local translation model directory does not exist: {path}")
+
+        try:
+            import torch
+            from transformers import MarianMTModel, MarianTokenizer
+        except Exception as exc:
+            raise TranslationUnavailable(
+                "Translation dependencies are unavailable. Install torch, transformers, and sentencepiece."
+            ) from exc
+
+        self.model_path = str(path)
+        self._torch = torch
+        self._lock = threading.Lock()
+        logger.info("Initializing local translation model at %s", self.model_path)
+        try:
+            self.tokenizer: Any = MarianTokenizer.from_pretrained(self.model_path, local_files_only=True)
+            self.model: Any = MarianMTModel.from_pretrained(self.model_path, local_files_only=True)
+            self.model.eval()
+        except Exception as exc:
+            raise TranslationUnavailable(f"Unable to load local translation model at {path}: {exc}") from exc
 
     def translate(self, text: str) -> str:
-        if not text.strip():
+        normalized = text.strip()
+        if not normalized:
             return ""
         try:
-            inputs = self.tokenizer(text, return_tensors="pt", padding=True)
-            outputs = self.model.generate(**inputs)
-            translated = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            return translated[0] if translated else ""
-        except Exception as e:
-            logger.error(f"Translation failed: {e}")
-            return f"【翻译失败】{text}"
+            with self._lock, self._torch.inference_mode():
+                inputs = self.tokenizer(normalized, return_tensors="pt", padding=True, truncation=True)
+                outputs = self.model.generate(**inputs)
+                translated = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        except Exception as exc:
+            logger.exception("Translation inference failed")
+            raise TranslationFailed(f"Local translation inference failed: {exc}") from exc
 
-# Global engine instance
-_engine = None
+        result = translated[0].strip() if translated else ""
+        if not result:
+            raise TranslationFailed("Local translation model returned empty text")
+        return result
+
+
+_engine: HuggingFaceTranslationEngine | None = None
+_engine_lock = threading.Lock()
+
 
 def get_translation_engine() -> HuggingFaceTranslationEngine:
     global _engine
-    if _engine is None:
-        model_dir = PROJECT_ROOT / "models" / "mt"
-        _engine = HuggingFaceTranslationEngine(model_dir)
+    if _engine is not None:
+        return _engine
+    with _engine_lock:
+        if _engine is None:
+            _engine = HuggingFaceTranslationEngine(DEFAULT_MT_MODEL)
     return _engine
 
+
 def translate_to_zh(text: str) -> str:
-    try:
-        return get_translation_engine().translate(text)
-    except Exception as e:
-        logger.error(f"Failed to load or run translation engine: {e}")
-        return f"【翻译错误】{text}"
+    return get_translation_engine().translate(text)

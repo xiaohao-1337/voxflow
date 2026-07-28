@@ -25,19 +25,16 @@ export function App() {
       <label>
         Source language
         <select value={settings.sourceLang} onChange={(event) => void update({ sourceLang: event.target.value as Settings['sourceLang'] })}>
-          <option value="en">English</option>
-          <option value="auto">Auto</option>
-          <option value="zh">Chinese</option>
+          <option value="en">English (current)</option>
         </select>
       </label>
       <label>
         Target language
         <select value={settings.targetLang} onChange={(event) => void update({ targetLang: event.target.value as Settings['targetLang'] })}>
-          <option value="zh">Chinese</option>
-          <option value="en">English</option>
+          <option value="zh">Simplified Chinese (current)</option>
         </select>
       </label>
-      <p>Local AI engine implementation is intentionally placeholder-only in this milestone.</p>
+      <p>Current release supports local English ASR and English-to-Chinese text translation.</p>
     </main>
   );
 }

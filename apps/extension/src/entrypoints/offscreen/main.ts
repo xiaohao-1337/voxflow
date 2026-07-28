@@ -10,6 +10,8 @@ const SEGMENT_MS = 7000;
 const MIN_SEGMENT_MS = 1200;
 const MAX_SEGMENT_MS = 12000;
 const ENGINE_CHUNK_MS = 200;
+const ENGINE_RECONNECT_MS = 2000;
+const PROTOCOL_VERSION = 'voxflow.local.v1' as const;
 
 let settings: Settings | null = null;
 let currentTabId: number | null = null;
@@ -28,6 +30,7 @@ let lastTranslatedText = '';
 let lastError: string | null = null;
 let tabCaptureHandle: TabCaptureHandle | null = null;
 let engineReady = false;
+let engineReconnectTimer: number | null = null;
 
 sendControl({ kind: 'OFFSCREEN_READY' }).catch(() => undefined);
 
@@ -127,7 +130,7 @@ function stopPipeline(): void {
   emitStatus({ state: 'idle' });
 }
 
-function onPcm(samples: number[], sampleRate: number, rms: number, peak: number): void {
+function onPcm(samples: ArrayLike<number>, sampleRate: number, rms: number, peak: number): void {
   const now = performance.now();
   const frames = samples.length;
   const bytes = samples.length * Float32Array.BYTES_PER_ELEMENT;
@@ -141,7 +144,7 @@ function onPcm(samples: number[], sampleRate: number, rms: number, peak: number)
     lastChunkAt: now,
   };
   emitStatus({ state: 'streaming' });
-  appendSegment(new Float32Array(samples), sampleRate);
+  appendSegment(samples instanceof Float32Array ? samples : new Float32Array(samples), sampleRate);
   if (capture.chunks % 12 === 0 && !lastTranslatedText) {
     sendSubtitle(`Capturing tab audio: ${formatSeconds(capture.durationMs)}. Waiting for translated text...`);
   }
@@ -151,7 +154,7 @@ function emitStatus(patch: Partial<RuntimeStatus> = {}): void {
   const state = patch.state ?? (capture.chunks > 0 ? 'streaming' : settings ? 'ready' : 'idle');
   const status: RuntimeStatus = {
     state,
-    engineConnected: false,
+    engineConnected: engineReady && Boolean(engine?.connected),
     currentTabId: patch.currentTabId ?? currentTabId,
     sourceLang: settings?.sourceLang ?? 'en',
     targetLang: settings?.targetLang ?? 'zh',
@@ -182,14 +185,25 @@ function sendSubtitle(hint: string): void {
 }
 
 async function connectEngine(): Promise<void> {
-  if (!settings) return;
+  if (!settings || engine) return;
   const client = new LocalEngineClient(settings.localEngineUrl, settings.localEngineToken);
   engine = client;
   client.onMessage(onEngineMessage);
-  client.onError(() => {
-    lastError = `Local engine error: ${settings?.localEngineUrl ?? ''}`;
-    emitStatus({ state: 'engine-offline', engineConnected: false, error: lastError });
+  client.onError((error) => {
+    if (engine !== client) return;
+    lastError = error instanceof Error ? error.message : `Local engine error: ${settings?.localEngineUrl ?? ''}`;
+    emitStatus({ state: 'engine-offline', engineConnected: client.connected, error: lastError });
     sendSubtitle(lastError);
+  });
+  client.onClose(() => {
+    if (engine !== client) return;
+    engine = null;
+    engineReady = false;
+    segmentBusy = false;
+    lastError = `Local engine disconnected: ${settings?.localEngineUrl ?? ''}`;
+    emitStatus({ state: 'engine-offline', engineConnected: false, error: lastError });
+    sendSubtitle(`${lastError}. Retrying...`);
+    scheduleEngineReconnect();
   });
   try {
     await client.connect();
@@ -198,22 +212,40 @@ async function connectEngine(): Promise<void> {
       return;
     }
     engineReady = true;
+    lastError = null;
     emitStatus({ state: 'ready', engineConnected: true });
     sendSubtitle('Local engine connected. Capturing audio...');
   } catch (error) {
+    if (engine !== client) return;
+    engine = null;
+    engineReady = false;
+    client.close();
     lastError = error instanceof Error ? error.message : String(error);
     emitStatus({ state: 'engine-offline', engineConnected: false, error: lastError });
-    sendSubtitle(lastError);
+    sendSubtitle(`${lastError}. Retrying...`);
+    scheduleEngineReconnect();
   }
 }
 
 function stopEngine(): void {
+  if (engineReconnectTimer !== null) window.clearTimeout(engineReconnectTimer);
+  engineReconnectTimer = null;
+  engineReady = false;
+  const client = engine;
+  engine = null;
   try {
-    engine?.close();
+    client?.close();
   } catch {
     // Ignore a closed WebSocket.
   }
-  engine = null;
+}
+
+function scheduleEngineReconnect(): void {
+  if (!settings || engineReconnectTimer !== null) return;
+  engineReconnectTimer = window.setTimeout(() => {
+    engineReconnectTimer = null;
+    void connectEngine();
+  }, ENGINE_RECONNECT_MS);
 }
 
 function appendSegment(samples: Float32Array, sampleRate: number): void {
@@ -221,12 +253,34 @@ function appendSegment(samples: Float32Array, sampleRate: number): void {
   if (!segmentStartedAt) segmentStartedAt = performance.now();
   segmentSamples.push(samples);
   segmentFrames += samples.length;
-  const durationMs = (segmentFrames / sampleRate) * 1000;
+  let durationMs = (segmentFrames / sampleRate) * 1000;
+  if (durationMs > MAX_SEGMENT_MS) {
+    trimSegmentBuffer(Math.round((sampleRate * MAX_SEGMENT_MS) / 1000));
+    durationMs = (segmentFrames / sampleRate) * 1000;
+    if (!engineReady || !engine?.connected) {
+      sendSubtitle(`Local engine is offline. Keeping only the latest ${formatSeconds(durationMs)} of audio...`);
+    }
+  }
   if (!segmentBusy && engineReady && engine?.connected && durationMs >= SEGMENT_MS) {
     const merged = drainSegment();
     void translateSegment(merged, sampleRate, durationMs);
-  } else if (!segmentBusy && durationMs >= MAX_SEGMENT_MS && (!engineReady || !engine?.connected)) {
-    sendSubtitle(`Captured ${formatSeconds(durationMs)}. Waiting for local engine connection...`);
+  }
+}
+
+function trimSegmentBuffer(maxFrames: number): void {
+  let excess = segmentFrames - maxFrames;
+  while (excess > 0 && segmentSamples.length > 0) {
+    const first = segmentSamples[0];
+    if (!first) break;
+    if (first.length <= excess) {
+      segmentSamples.shift();
+      segmentFrames -= first.length;
+      excess -= first.length;
+      continue;
+    }
+    segmentSamples[0] = first.subarray(excess);
+    segmentFrames -= excess;
+    excess = 0;
   }
 }
 
@@ -250,32 +304,80 @@ async function translateSegment(samples: Float32Array, sampleRate: number, durat
   const sessionId = `voxflow-${Date.now()}-${sessionSeq++}`;
   try {
     engine.send({
+      v: PROTOCOL_VERSION,
       type: 'session.start',
       sessionId,
-      sourceLang: normalizeLang(settings.sourceLang),
-      targetLang: normalizeLang(settings.targetLang),
-      sampleRate: 16000,
-      asrProvider: 'funasr',
-      mtProvider: settings.mtProvider,
-      ttsProvider: settings.ttsProvider,
+      requestId: `${sessionId}-start`,
+      pipeline: {
+        stages: ['asr', 'mt'],
+        emitIntermediates: true,
+        latencyMode: settings.latencyMode === 'low-latency' ? 'realtime' : 'balanced',
+      },
+      models: {
+        asr: {
+          provider: settings.asrProvider,
+          language: normalizeLang(settings.sourceLang),
+          mode: 'segment',
+        },
+        mt: {
+          provider: settings.mtProvider,
+          sourceLang: normalizeLang(settings.sourceLang),
+          targetLang: normalizeLang(settings.targetLang),
+        },
+      },
+      input: {
+        audio: {
+          streamId: 'tab-audio-main',
+          sampleRate: 16000,
+          channels: 1,
+          sampleFormat: 'f32le',
+          codec: 'pcm',
+          frameDurationMs: ENGINE_CHUNK_MS,
+        },
+      },
     });
     const baseTimestampMs = Math.max(0, Math.round(capture.durationMs - durationMs));
     const chunkFrames = Math.max(1, Math.round((sampleRate * ENGINE_CHUNK_MS) / 1000));
     let seq = 0;
     for (let offset = 0; offset < samples.length; offset += chunkFrames) {
       const chunk = samples.subarray(offset, Math.min(samples.length, offset + chunkFrames));
+      const chunkDurationMs = Math.round((chunk.length / sampleRate) * 1000);
       engine.send({
+        v: PROTOCOL_VERSION,
         type: 'audio.chunk',
         sessionId,
+        requestId: `${sessionId}-audio-${seq}`,
+        streamId: 'tab-audio-main',
         seq,
-        timestampMs: baseTimestampMs + Math.round((offset / sampleRate) * 1000),
-        sampleRate: 16000,
-        format: 'f32le',
-        audio: encodeF32leBase64(chunk),
+        time: {
+          startMs: baseTimestampMs + Math.round((offset / sampleRate) * 1000),
+          durationMs: chunkDurationMs,
+          captureUnixMs: Date.now(),
+        },
+        audio: {
+          transport: 'json.base64',
+          codec: 'pcm',
+          sampleFormat: 'f32le',
+          endianness: 'little',
+          sampleRate: 16000,
+          channels: 1,
+          channelLayout: 'mono',
+          frameCount: chunk.length,
+          byteLength: chunk.byteLength,
+          data: encodeF32leBase64(chunk),
+        },
       });
       seq += 1;
     }
-    engine.send({ type: 'session.stop', sessionId });
+    engine.send({
+      v: PROTOCOL_VERSION,
+      type: 'audio.end',
+      sessionId,
+      requestId: `${sessionId}-audio-end`,
+      streamId: 'tab-audio-main',
+      lastSeq: seq - 1,
+      reason: 'segment_complete',
+    });
     emitStatus({ state: 'streaming', engineConnected: true });
   } catch (error) {
     segmentBusy = false;
@@ -288,7 +390,14 @@ async function translateSegment(samples: Float32Array, sampleRate: number, durat
 function onEngineMessage(message: LocalEngineServerMessage): void {
   switch (message.type) {
     case 'engine.status':
-      if (message.message === 'stopped') segmentBusy = false;
+      if (message.state === 'stopped') segmentBusy = false;
+      if (message.state === 'error') {
+        segmentBusy = false;
+        lastError = message.message ?? 'Local engine pipeline failed';
+        emitStatus({ state: 'error', engineConnected: true, error: lastError });
+        sendSubtitle(lastError);
+        break;
+      }
       emitStatus({ state: capture.chunks > 0 ? 'streaming' : 'ready', engineConnected: true });
       if (!segmentBusy && segmentFrames >= (16000 * SEGMENT_MS) / 1000 && engine?.connected) {
         const durationMs = (segmentFrames / 16000) * 1000;
@@ -300,9 +409,9 @@ function onEngineMessage(message: LocalEngineServerMessage): void {
       lastAsrText = message.text;
       emitStatus({ asrText: lastAsrText, engineConnected: true });
       break;
-    case 'translation.final':
-      lastAsrText = message.sourceText;
-      lastTranslatedText = message.translatedText;
+    case 'mt.final':
+      lastAsrText = message.source.text;
+      lastTranslatedText = message.target.text;
       lastError = null;
       emitStatus({
         state: 'streaming',
@@ -312,6 +421,22 @@ function onEngineMessage(message: LocalEngineServerMessage): void {
         error: null,
       });
       sendSubtitle('Translated by local FunASR pipeline.');
+      break;
+    case 'result.final':
+      if (message.kind === 'asr' && message.text) {
+        lastAsrText = message.text;
+      } else if ((message.kind === 'text' || message.kind === 'audio') && message.translatedText) {
+        lastAsrText = message.sourceText ?? lastAsrText;
+        lastTranslatedText = message.translatedText;
+        sendSubtitle('Translated by local FunASR pipeline.');
+      }
+      emitStatus({
+        state: 'streaming',
+        engineConnected: true,
+        asrText: lastAsrText,
+        translatedText: lastTranslatedText,
+        error: null,
+      });
       break;
     case 'error':
       segmentBusy = false;
@@ -362,13 +487,16 @@ async function startTabCapture(streamId: string): Promise<TabCaptureHandle> {
       | { type?: string; samples?: ArrayBuffer; sampleRate?: number; rms?: number; peak?: number }
       | undefined;
     if (data?.type !== 'pcm' || !data.samples || !data.sampleRate) return;
-    onPcm(Array.from(new Float32Array(data.samples)), data.sampleRate, data.rms ?? 0, data.peak ?? 0);
+    onPcm(new Float32Array(data.samples), data.sampleRate, data.rms ?? 0, data.peak ?? 0);
   };
 
   node.port.addEventListener('message', onMessage);
   node.port.start();
   source.connect(node);
-  node.connect(ctx.destination);
+  const silentSink = ctx.createGain();
+  silentSink.gain.value = 0;
+  node.connect(silentSink);
+  silentSink.connect(ctx.destination);
   if (ctx.state === 'suspended') await ctx.resume().catch(() => undefined);
 
   return {
@@ -378,6 +506,7 @@ async function startTabCapture(streamId: string): Promise<TabCaptureHandle> {
       try {
         source.disconnect();
         node.disconnect();
+        silentSink.disconnect();
       } catch {
         // Ignore already disconnected audio nodes.
       }

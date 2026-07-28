@@ -23,6 +23,7 @@ from src.config import DEFAULT_ASR_LANGUAGE, DEFAULT_ASR_MODEL
 
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+PROTOCOL_VERSION = "voxflow.local.v1"
 
 
 async def main() -> None:
@@ -37,6 +38,11 @@ async def main() -> None:
     parser.add_argument("--target-lang", default="zh")
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL)
     parser.add_argument("--asr-language", default=None)
+    parser.add_argument(
+        "--stages",
+        default="asr,mt",
+        help="Comma-separated pipeline stages: asr, asr,mt, or asr,mt,tts.",
+    )
     args = parser.parse_args()
 
     reader, writer = await asyncio.open_connection(args.host, args.port)
@@ -46,19 +52,57 @@ async def main() -> None:
     await send_json(
         writer,
         {
+            "v": PROTOCOL_VERSION,
             "type": "session.start",
             "sessionId": session_id,
-            "sourceLang": args.source_lang,
-            "targetLang": args.target_lang,
-            "sampleRate": args.sample_rate,
-            "asrProvider": "funasr",
-            "asrModel": args.asr_model,
-            "asrLanguage": args.asr_language or args.source_lang,
-            "mtProvider": "argos",
-            "ttsProvider": "piper",
+            "requestId": "manual-start",
+            "pipeline": {
+                "stages": parse_stages(args.stages),
+                "emitIntermediates": True,
+                "latencyMode": "balanced",
+            },
+            "models": {
+                "asr": {
+                    "provider": "funasr",
+                    "model": args.asr_model,
+                    "language": args.asr_language or args.source_lang,
+                    "device": "cpu",
+                    "mode": "segment",
+                },
+                "mt": {
+                    "provider": "huggingface",
+                    "sourceLang": args.source_lang,
+                    "targetLang": args.target_lang,
+                },
+                "tts": {
+                    "provider": "piper",
+                    "language": args.target_lang,
+                    "outputAudio": {
+                        "codec": "pcm",
+                        "sampleFormat": "pcm16le",
+                        "sampleRate": args.sample_rate,
+                        "channels": 1,
+                    },
+                },
+            },
+            "input": {
+                "audio": {
+                    "streamId": "manual-audio",
+                    "sampleRate": args.sample_rate,
+                    "channels": 1,
+                    "sampleFormat": "f32le",
+                    "codec": "pcm",
+                    "frameDurationMs": args.chunk_ms,
+                }
+            },
         },
     )
-    print_event(await recv_json(reader))
+    ready_events = await drain_until_session_ready(reader)
+    for event in ready_events:
+        print_event(event)
+    start_error = next((event for event in ready_events if event.get("type") == "error"), None)
+    if start_error:
+        raise RuntimeError(f"{start_error.get('code')}: {start_error.get('message')}")
 
     if args.wav:
         samples, sample_rate = read_wav_as_f32(args.wav)
@@ -72,13 +116,28 @@ async def main() -> None:
         await send_json(
             writer,
             {
+                "v": PROTOCOL_VERSION,
                 "type": "audio.chunk",
                 "sessionId": session_id,
+                "requestId": f"manual-audio-{seq}",
+                "streamId": "manual-audio",
                 "seq": seq,
-                "timestampMs": int(offset / sample_rate * 1000),
-                "sampleRate": sample_rate,
-                "format": "f32le",
-                "audio": base64.b64encode(pack_f32le(chunk)).decode("ascii"),
+                "time": {
+                    "startMs": int(offset / sample_rate * 1000),
+                    "durationMs": int(len(chunk) / sample_rate * 1000),
+                },
+                "audio": {
+                    "transport": "json.base64",
+                    "codec": "pcm",
+                    "sampleFormat": "f32le",
+                    "endianness": "little",
+                    "sampleRate": sample_rate,
+                    "channels": 1,
+                    "channelLayout": "mono",
+                    "frameCount": len(chunk),
+                    "byteLength": len(chunk) * 4,
+                    "data": base64.b64encode(pack_f32le(chunk)).decode("ascii"),
+                },
             },
         )
         seq += 1
@@ -89,7 +148,18 @@ async def main() -> None:
     for event in await drain_events(reader, timeout=0.05, max_events=20):
         print_event(event)
 
-    await send_json(writer, {"type": "session.stop", "sessionId": session_id})
+    await send_json(
+        writer,
+        {
+            "v": PROTOCOL_VERSION,
+            "type": "audio.end",
+            "sessionId": session_id,
+            "requestId": "manual-audio-end",
+            "streamId": "manual-audio",
+            "lastSeq": seq - 1,
+            "reason": "segment_complete",
+        },
+    )
     for event in await drain_until_stopped(reader):
         print_event(event)
     await send_close(writer)
@@ -122,6 +192,11 @@ def read_wav_as_f32(path: Path) -> tuple[list[float], int]:
 
 def pack_f32le(samples: list[float]) -> bytes:
     return struct.pack("<" + "f" * len(samples), *samples)
+
+
+def parse_stages(value: str) -> list[str]:
+    stages = [stage.strip() for stage in value.split(",") if stage.strip()]
+    return stages or ["asr", "mt"]
 
 
 async def websocket_handshake(
@@ -187,11 +262,29 @@ async def drain_until_stopped(
     return events
 
 
+async def drain_until_session_ready(
+    reader: asyncio.StreamReader,
+    timeout: float = 20.0,
+    max_events: int = 10,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for _ in range(max_events):
+        event = await asyncio.wait_for(recv_json(reader), timeout=timeout)
+        events.append(event)
+        if event.get("type") == "engine.status" and event.get("state") == "ready":
+            break
+        if event.get("type") == "error" and not event.get("recoverable", True):
+            break
+    return events
+
+
 def print_event(event: dict[str, Any]) -> None:
     display = deepcopy(event)
     audio = display.get("audio")
     if isinstance(audio, str):
         display["audio"] = f"<base64 {len(audio)} chars>"
+    elif isinstance(audio, dict) and isinstance(audio.get("data"), str):
+        audio["data"] = f"<base64 {len(audio['data'])} chars>"
     print(display)
 
 

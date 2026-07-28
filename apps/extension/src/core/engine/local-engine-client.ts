@@ -1,11 +1,19 @@
 import type { LocalEngineClientMessage, LocalEngineServerMessage } from './local-engine-protocol';
 
+export type LocalEngineClientError = Error | Event;
+
 export class LocalEngineClient {
   private socket: WebSocket | null = null;
+  private connecting: Promise<void> | null = null;
   private handlers = new Set<(message: LocalEngineServerMessage) => void>();
-  private errorHandlers = new Set<(error: Event) => void>();
+  private errorHandlers = new Set<(error: LocalEngineClientError) => void>();
+  private closeHandlers = new Set<(event: CloseEvent) => void>();
 
-  constructor(readonly url: string, readonly token = '') {}
+  constructor(
+    readonly url: string,
+    readonly token = '',
+    private readonly connectTimeoutMs = 5000,
+  ) {}
 
   get connected(): boolean {
     return this.socket?.readyState === WebSocket.OPEN;
@@ -13,18 +21,34 @@ export class LocalEngineClient {
 
   async connect(): Promise<void> {
     if (this.connected) return;
+    if (this.connecting) return this.connecting;
+    this.connecting = this.connectInner().finally(() => {
+      this.connecting = null;
+    });
+    return this.connecting;
+  }
+
+  private async connectInner(): Promise<void> {
     const url = withToken(this.url, this.token);
-    this.socket = new WebSocket(url);
-    this.socket.addEventListener('message', (event) => this.handleMessage(event));
-    this.socket.addEventListener('error', (event) => {
-      for (const handler of this.errorHandlers) handler(event);
+    const socket = new WebSocket(url);
+    this.socket = socket;
+    socket.addEventListener('message', (event) => {
+      if (this.socket === socket) this.handleMessage(event);
+    });
+    socket.addEventListener('error', (event) => {
+      if (this.socket === socket) this.emitError(event);
+    });
+    socket.addEventListener('close', (event) => {
+      if (this.socket !== socket) return;
+      this.socket = null;
+      for (const handler of this.closeHandlers) handler(event);
     });
     await new Promise<void>((resolve, reject) => {
-      const socket = this.socket;
-      if (!socket) return reject(new Error('WebSocket was not created'));
       const cleanup = () => {
+        window.clearTimeout(timer);
         socket.removeEventListener('open', onOpen);
         socket.removeEventListener('error', onError);
+        socket.removeEventListener('close', onClose);
       };
       const onOpen = () => {
         cleanup();
@@ -34,8 +58,19 @@ export class LocalEngineClient {
         cleanup();
         reject(new Error(`Unable to connect local engine: ${this.url}`));
       };
+      const onClose = () => {
+        cleanup();
+        reject(new Error(`Local engine closed before connection completed: ${this.url}`));
+      };
+      const timer = window.setTimeout(() => {
+        cleanup();
+        if (this.socket === socket) this.socket = null;
+        socket.close();
+        reject(new Error(`Local engine connection timed out after ${this.connectTimeoutMs}ms: ${this.url}`));
+      }, this.connectTimeoutMs);
       socket.addEventListener('open', onOpen);
       socket.addEventListener('error', onError);
+      socket.addEventListener('close', onClose);
     });
   }
 
@@ -49,20 +84,35 @@ export class LocalEngineClient {
     return () => this.handlers.delete(handler);
   }
 
-  onError(handler: (error: Event) => void): () => void {
+  onError(handler: (error: LocalEngineClientError) => void): () => void {
     this.errorHandlers.add(handler);
     return () => this.errorHandlers.delete(handler);
   }
 
+  onClose(handler: (event: CloseEvent) => void): () => void {
+    this.closeHandlers.add(handler);
+    return () => this.closeHandlers.delete(handler);
+  }
+
   close(): void {
-    this.socket?.close();
+    const socket = this.socket;
     this.socket = null;
+    socket?.close();
   }
 
   private handleMessage(event: MessageEvent): void {
     if (typeof event.data !== 'string') return;
-    const message = JSON.parse(event.data) as LocalEngineServerMessage;
-    for (const handler of this.handlers) handler(message);
+    try {
+      const message = JSON.parse(event.data) as unknown;
+      if (!isServerMessage(message)) throw new Error('Local engine returned an invalid message envelope');
+      for (const handler of this.handlers) handler(message);
+    } catch (error) {
+      this.emitError(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private emitError(error: LocalEngineClientError): void {
+    for (const handler of this.errorHandlers) handler(error);
   }
 }
 
@@ -82,4 +132,8 @@ function withToken(url: string, token: string): string {
   const parsed = new URL(url);
   parsed.searchParams.set('token', token);
   return parsed.toString();
+}
+
+function isServerMessage(value: unknown): value is LocalEngineServerMessage {
+  return Boolean(value && typeof value === 'object' && typeof (value as { type?: unknown }).type === 'string');
 }
