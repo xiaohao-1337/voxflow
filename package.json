@@ -11,6 +11,9 @@
     "watch": "wxt --watch",
     "zip": "wxt zip",
     "compile": "wxt prepare && tsc --noEmit",
+    "test:extension": "node --test apps/extension/tests/*.test.ts",
+    "test:audio": "node --test packages/audio/tests/*.test.ts",
+    "test": "npm run test:extension && npm run test:audio",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

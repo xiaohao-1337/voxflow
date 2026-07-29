@@ -27,8 +27,10 @@ PROTOCOL_VERSION = "voxflow.local.v1"
 DEFAULT_STAGES = ["asr", "mt"]
 MAX_CHUNK_BYTES = 1024 * 1024
 MAX_SESSION_DURATION_MS = 120_000
+AUDIO_STATS_INTERVAL_MS = 1_000
 SUPPORTED_MT_SOURCE_LANGUAGES = {"en", "en-us", "en-gb"}
 SUPPORTED_MT_TARGET_LANGUAGES = {"zh", "zh-cn", "zh-hans"}
+SUPPORTED_MT_PROVIDERS = {"huggingface"}
 
 
 @dataclass
@@ -50,6 +52,7 @@ class LocalEngineSession:
     emit_intermediates: bool = True
     source_lang: str = "en"
     target_lang: str = "zh"
+    mt_provider: str = "huggingface"
     sample_rate: int = 16000
     channels: int = 1
     sample_format: str = "f32le"
@@ -60,10 +63,12 @@ class LocalEngineSession:
     audio_buffer: bytearray = field(default_factory=bytearray)
     funasr: FunAsrEngine | None = None
     funasr_error: str | None = None
+    last_stats_emitted_chunks: int = 0
+    next_stats_emit_ms: int = AUDIO_STATS_INTERVAL_MS
 
     def start(self, message: dict[str, Any]) -> list[dict[str, Any]]:
-        self.session_id = str(message.get("sessionId") or "manual-session")
-        self.protocol_version = str(message.get("v") or PROTOCOL_VERSION)
+        self.session_id = str(message.get("sessionId") or "")
+        self.protocol_version = str(message.get("v") or "")
         self.request_id = str(message["requestId"]) if message.get("requestId") else None
         self.stages = parse_stages(message)
 
@@ -84,6 +89,7 @@ class LocalEngineSession:
         self.target_lang = str(
             mt_config.get("targetLang") or message.get("targetLang") or "zh"
         ).lower()
+        self.mt_provider = str(mt_config.get("provider") or "huggingface").lower()
         self.sample_rate = int(audio_input.get("sampleRate") or message.get("sampleRate") or 16000)
         self.channels = int(audio_input.get("channels") or 1)
         self.sample_format = normalize_sample_format(
@@ -95,8 +101,18 @@ class LocalEngineSession:
         self.audio_buffer = bytearray()
         self.funasr = None
         self.funasr_error = None
+        self.last_stats_emitted_chunks = 0
+        self.next_stats_emit_ms = AUDIO_STATS_INTERVAL_MS
 
-        events: list[dict[str, Any]] = [
+        events: list[dict[str, Any]] = []
+        validation_error = self.validate_configuration()
+        if validation_error:
+            code, detail = validation_error
+            events.append(self.error(code, detail, recoverable=False))
+            events.append(self.status("error", detail))
+            return events
+
+        events.append(
             {
                 "v": PROTOCOL_VERSION,
                 "type": "session.started",
@@ -105,14 +121,7 @@ class LocalEngineSession:
                 "acceptedStages": self.stages,
                 "message": "session accepted",
             }
-        ]
-
-        validation_error = self.validate_configuration()
-        if validation_error:
-            code, detail = validation_error
-            events.append(self.error(code, detail, recoverable=False))
-            events.append(self.status("error", detail))
-            return events
+        )
 
         model = str(asr_config.get("model") or message.get("asrModel") or DEFAULT_ASR_MODEL)
         language = str(
@@ -150,6 +159,11 @@ class LocalEngineSession:
         if "asr" not in self.stages:
             return "invalid_pipeline", "The asr stage is required before mt or tts"
         if "mt" in self.stages:
+            if self.mt_provider not in SUPPORTED_MT_PROVIDERS:
+                return (
+                    "mt_provider_unavailable",
+                    f"MT provider '{self.mt_provider}' is not implemented; use huggingface",
+                )
             if self.source_lang not in SUPPORTED_MT_SOURCE_LANGUAGES:
                 return "unsupported_source_language", "Current local MT model supports English input only"
             if self.target_lang not in SUPPORTED_MT_TARGET_LANGUAGES:
@@ -209,23 +223,15 @@ class LocalEngineSession:
         self.stats.peak = max(self.stats.peak, float(chunk["peak"]))
         self.last_audio_seq = int(message["seq"])
 
-        return [
-            {
-                "v": PROTOCOL_VERSION,
-                "type": "audio.stats",
-                "sessionId": self.session_id,
-                "requestId": message.get("requestId"),
-                "streamId": message.get("streamId") or self.stream_id,
-                "chunks": self.stats.chunks,
-                "bytes": self.stats.bytes,
-                "samples": self.stats.samples,
-                "durationMs": duration_ms,
-                "rms": round(self.stats.rms, 6),
-                "peak": round(self.stats.peak, 6),
-            }
-        ]
+        if duration_ms >= self.next_stats_emit_ms:
+            while self.next_stats_emit_ms <= duration_ms:
+                self.next_stats_emit_ms += AUDIO_STATS_INTERVAL_MS
+            self.last_stats_emitted_chunks = self.stats.chunks
+            return [self.audio_stats(message.get("requestId"))]
+        return []
 
     def validate_audio_envelope(self, message: dict[str, Any]) -> None:
+        self.validate_message_version(message)
         if self.finalized:
             raise ValueError("session is already finalized")
         if not self.session_id:
@@ -248,9 +254,24 @@ class LocalEngineSession:
             raise ValueError("audio.chunk only supports PCM audio")
 
     def end_audio(self, message: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        if message and str(message.get("sessionId") or "") != self.session_id:
-            raise ValueError("audio.end sessionId does not match the active session")
-        events = self.finalize()
+        if message:
+            self.validate_message_version(message)
+            if str(message.get("sessionId") or "") != self.session_id:
+                raise ValueError("audio.end sessionId does not match the active session")
+            if str(message.get("streamId") or "") != self.stream_id:
+                raise ValueError("audio.end streamId does not match the active stream")
+            last_seq = message.get("lastSeq")
+            if not isinstance(last_seq, int) or isinstance(last_seq, bool):
+                raise ValueError("audio.end lastSeq must be an integer")
+            if last_seq != self.last_audio_seq:
+                raise ValueError(
+                    f"audio.end lastSeq mismatch: expected {self.last_audio_seq}, got {last_seq}"
+                )
+        events: list[dict[str, Any]] = []
+        if self.stats.chunks > self.last_stats_emitted_chunks:
+            events.append(self.audio_stats((message or {}).get("requestId")))
+            self.last_stats_emitted_chunks = self.stats.chunks
+        events.extend(self.finalize())
         events.append(
             self.status(
                 "stopped",
@@ -264,6 +285,9 @@ class LocalEngineSession:
         return self.end_audio()
 
     def cancel(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        self.validate_message_version(message)
+        if str(message.get("sessionId") or "") != self.session_id:
+            raise ValueError("session.cancel sessionId does not match the active session")
         self.finalized = True
         self.audio_buffer.clear()
         return [
@@ -387,6 +411,25 @@ class LocalEngineSession:
         if stage:
             event["stage"] = stage
         return event
+
+    def audio_stats(self, request_id: str | None) -> dict[str, Any]:
+        return {
+            "v": PROTOCOL_VERSION,
+            "type": "audio.stats",
+            "sessionId": self.session_id,
+            "requestId": request_id,
+            "streamId": self.stream_id,
+            "chunks": self.stats.chunks,
+            "bytes": self.stats.bytes,
+            "samples": self.stats.samples,
+            "durationMs": int(self.stats.samples / self.sample_rate * 1000),
+            "rms": round(self.stats.rms, 6),
+            "peak": round(self.stats.peak, 6),
+        }
+
+    def validate_message_version(self, message: dict[str, Any]) -> None:
+        if str(message.get("v") or "") != PROTOCOL_VERSION:
+            raise ValueError(f"Unsupported protocol version: {message.get('v')}")
 
     def error(self, code: str, message: str, recoverable: bool = True) -> dict[str, Any]:
         return {

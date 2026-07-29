@@ -6,9 +6,14 @@ class VoxflowPcmCaptureProcessor extends AudioWorkletProcessor {
     super();
     this.sourceRate = sampleRate;
     this.ratio = this.sourceRate / TARGET_RATE;
-    this.sourceBuffer = [];
-    this.outputBuffer = [];
-    this.readPos = 0;
+    this.sourceIndex = -1;
+    this.nextOutputPosition = 0;
+    this.previousSample = 0;
+    this.hasPreviousSample = false;
+    this.outputFrame = new Float32Array(CHUNK_FRAMES);
+    this.outputIndex = 0;
+    this.outputSumSq = 0;
+    this.outputPeak = 0;
   }
 
   process(inputs) {
@@ -20,44 +25,51 @@ class VoxflowPcmCaptureProcessor extends AudioWorkletProcessor {
     for (let i = 0; i < frameCount; i++) {
       let sum = 0;
       for (let channel = 0; channel < channels; channel++) sum += input[channel][i] || 0;
-      this.sourceBuffer.push(sum / channels);
-    }
-
-    while (this.readPos + 1 < this.sourceBuffer.length) {
-      const index = Math.floor(this.readPos);
-      const fraction = this.readPos - index;
-      const s0 = this.sourceBuffer[index] || 0;
-      const s1 = this.sourceBuffer[index + 1] || s0;
-      this.outputBuffer.push(s0 + (s1 - s0) * fraction);
-      this.readPos += this.ratio;
-    }
-
-    const consumed = Math.floor(this.readPos);
-    if (consumed > 0) {
-      this.sourceBuffer.splice(0, consumed);
-      this.readPos -= consumed;
-    }
-
-    while (this.outputBuffer.length >= CHUNK_FRAMES) {
-      const frame = new Float32Array(CHUNK_FRAMES);
-      let sumSq = 0;
-      let peak = 0;
-      for (let i = 0; i < CHUNK_FRAMES; i++) {
-        const sample = this.outputBuffer[i] || 0;
-        frame[i] = sample;
-        const abs = Math.abs(sample);
-        if (abs > peak) peak = abs;
-        sumSq += sample * sample;
-      }
-      this.outputBuffer.splice(0, CHUNK_FRAMES);
-      const rms = Math.sqrt(sumSq / CHUNK_FRAMES);
-      this.port.postMessage(
-        { type: 'pcm', samples: frame.buffer, sampleRate: TARGET_RATE, rms, peak },
-        [frame.buffer],
-      );
+      this.pushSourceSample(sum / channels);
     }
 
     return true;
+  }
+
+  pushSourceSample(sample) {
+    this.sourceIndex += 1;
+    if (!this.hasPreviousSample) {
+      this.previousSample = sample;
+      this.hasPreviousSample = true;
+      this.pushOutputSample(sample);
+      this.nextOutputPosition = this.ratio;
+      return;
+    }
+
+    const leftPosition = this.sourceIndex - 1;
+    while (this.nextOutputPosition <= this.sourceIndex) {
+      const fraction = this.nextOutputPosition - leftPosition;
+      const output = this.previousSample + (sample - this.previousSample) * fraction;
+      this.pushOutputSample(output);
+      this.nextOutputPosition += this.ratio;
+    }
+    this.previousSample = sample;
+  }
+
+  pushOutputSample(sample) {
+    this.outputFrame[this.outputIndex] = sample;
+    this.outputIndex += 1;
+    const absolute = Math.abs(sample);
+    this.outputPeak = Math.max(this.outputPeak, absolute);
+    this.outputSumSq += sample * sample;
+    if (this.outputIndex < CHUNK_FRAMES) return;
+
+    const frame = this.outputFrame;
+    const rms = Math.sqrt(this.outputSumSq / CHUNK_FRAMES);
+    const peak = this.outputPeak;
+    this.outputFrame = new Float32Array(CHUNK_FRAMES);
+    this.outputIndex = 0;
+    this.outputSumSq = 0;
+    this.outputPeak = 0;
+    this.port.postMessage(
+      { type: 'pcm', samples: frame.buffer, sampleRate: TARGET_RATE, rms, peak },
+      [frame.buffer],
+    );
   }
 }
 

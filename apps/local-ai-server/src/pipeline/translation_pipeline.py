@@ -78,5 +78,9 @@ def get_translation_engine() -> HuggingFaceTranslationEngine:
     return _engine
 
 
+def has_loaded_translation_engine() -> bool:
+    return _engine is not None
+
+
 def translate_to_zh(text: str) -> str:
     return get_translation_engine().translate(text)

@@ -1,4 +1,8 @@
-import type { LocalEngineClientMessage, LocalEngineServerMessage } from './local-engine-protocol';
+import type {
+  EngineHealthResponse,
+  LocalEngineClientMessage,
+  LocalEngineServerMessage,
+} from './local-engine-protocol';
 
 export type LocalEngineClientError = Error | Event;
 
@@ -26,6 +30,32 @@ export class LocalEngineClient {
       this.connecting = null;
     });
     return this.connecting;
+  }
+
+  async checkHealth(): Promise<EngineHealthResponse> {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), this.connectTimeoutMs);
+    try {
+      const response = await fetch(withToken(toHealthUrl(this.url), this.token), {
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`Local engine health check failed: HTTP ${response.status}`);
+      }
+      const health = (await response.json()) as unknown;
+      if (!isHealthResponse(health)) {
+        throw new Error('Local engine returned an invalid health response');
+      }
+      return health;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new Error(`Local engine health check timed out after ${this.connectTimeoutMs}ms: ${this.url}`);
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timer);
+    }
   }
 
   private async connectInner(): Promise<void> {
@@ -134,6 +164,49 @@ function withToken(url: string, token: string): string {
   return parsed.toString();
 }
 
+function toHealthUrl(websocketUrl: string): string {
+  const parsed = new URL(websocketUrl);
+  parsed.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
+  parsed.pathname = '/health';
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.toString();
+}
+
 function isServerMessage(value: unknown): value is LocalEngineServerMessage {
-  return Boolean(value && typeof value === 'object' && typeof (value as { type?: unknown }).type === 'string');
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      (value as { v?: unknown }).v === 'voxflow.local.v1' &&
+      typeof (value as { type?: unknown }).type === 'string' &&
+      typeof (value as { sessionId?: unknown }).sessionId === 'string',
+  );
+}
+
+function isHealthResponse(value: unknown): value is EngineHealthResponse {
+  if (!value || typeof value !== 'object') return false;
+  const health = value as Partial<EngineHealthResponse>;
+  return (
+    health.service === 'voxflow-local-engine' &&
+    health.protocol === 'voxflow.local.v1' &&
+    (health.status === 'ok' || health.status === 'degraded') &&
+    Boolean(
+      health.models &&
+        typeof health.models === 'object' &&
+        isModelHealth(health.models.asr) &&
+        isModelHealth(health.models.mt) &&
+        isModelHealth(health.models.tts),
+    )
+  );
+}
+
+function isModelHealth(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const model = value as { ready?: unknown; path?: unknown; missing?: unknown };
+  return (
+    typeof model.ready === 'boolean' &&
+    typeof model.path === 'string' &&
+    Array.isArray(model.missing) &&
+    model.missing.every((entry) => typeof entry === 'string')
+  );
 }

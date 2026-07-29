@@ -1,21 +1,30 @@
-import { EMPTY_CAPTURE_STATS, type CaptureStats, type RuntimeStatus, type Settings } from '../../core/types';
+import {
+  EMPTY_CAPTURE_STATS,
+  type CaptureStats,
+  type PipelineState,
+  type RuntimeStatus,
+  type Settings,
+} from '../../core/types';
 import { PCM_CAPTURE_PROCESSOR_NAME, getPcmCaptureWorkletUrl } from '../../core/audio/pcm-capture.worklet';
+import { SilenceSegmenter } from '../../core/audio/silence-segmenter';
 import { encodeF32leBase64, LocalEngineClient } from '../../core/engine/local-engine-client';
-import type { LocalEngineServerMessage } from '../../core/engine/local-engine-protocol';
-import { onControlMessage, onPcmPortConnect, sendControl } from '../../messaging/bridge';
+import {
+  LOCAL_ENGINE_PROTOCOL_VERSION,
+  type EngineHealthResponse,
+  type LocalEngineServerMessage,
+} from '../../core/engine/local-engine-protocol';
+import { onControlMessage, onSessionPortConnect, sendControl } from '../../messaging/bridge';
 import { PORT } from '../../messaging/protocol';
-import type { PcmPort } from '../../messaging/bridge';
+import type { SessionPort } from '../../messaging/bridge';
 
-const SEGMENT_MS = 7000;
 const MIN_SEGMENT_MS = 1200;
-const MAX_SEGMENT_MS = 12000;
+const MAX_BUFFER_MS = 12000;
 const ENGINE_CHUNK_MS = 200;
 const ENGINE_RECONNECT_MS = 2000;
-const PROTOCOL_VERSION = 'voxflow.local.v1' as const;
 
 let settings: Settings | null = null;
 let currentTabId: number | null = null;
-let contentPort: PcmPort | null = null;
+let contentPort: SessionPort | null = null;
 let capture: CaptureStats = { ...EMPTY_CAPTURE_STATS };
 let statusTimer: number | null = null;
 let startedAt: number | null = null;
@@ -23,14 +32,16 @@ let engine: LocalEngineClient | null = null;
 let sessionSeq = 0;
 let segmentSamples: Float32Array[] = [];
 let segmentFrames = 0;
-let segmentStartedAt = 0;
 let segmentBusy = false;
+let segmentReady = false;
+const silenceSegmenter = new SilenceSegmenter();
 let lastAsrText = '';
 let lastTranslatedText = '';
 let lastError: string | null = null;
 let tabCaptureHandle: TabCaptureHandle | null = null;
 let engineReady = false;
 let engineReconnectTimer: number | null = null;
+let pipelineState: PipelineState = 'idle';
 
 sendControl({ kind: 'OFFSCREEN_READY' }).catch(() => undefined);
 
@@ -50,7 +61,7 @@ onControlMessage((msg) => {
   }
 });
 
-onPcmPortConnect(PORT.PCM, (port) => {
+onSessionPortConnect(PORT.SESSION, (port) => {
   contentPort = port;
   port.onDisconnect(() => {
     if (contentPort === port) contentPort = null;
@@ -59,11 +70,11 @@ onPcmPortConnect(PORT.PCM, (port) => {
   port.on((msg) => {
     switch (msg.kind) {
       case 'READY':
-        emitStatus({ state: 'capturing', currentTabId: msg.tabId || currentTabId });
+        emitStatus({
+          state: lastError && !engineReady ? 'engine-offline' : 'capturing',
+          currentTabId: msg.tabId || currentTabId,
+        });
         sendSubtitle('Audio capture is active. Waiting for PCM frames...');
-        break;
-      case 'PCM':
-        onPcm(msg.samples, msg.sampleRate, msg.rms, msg.peak);
         break;
       case 'VIDEO_TIME':
         void msg;
@@ -86,8 +97,9 @@ async function startPipeline(nextSettings: Settings, tabId: number | null, strea
   startedAt = performance.now();
   segmentSamples = [];
   segmentFrames = 0;
-  segmentStartedAt = 0;
   segmentBusy = false;
+  segmentReady = false;
+  silenceSegmenter.reset();
   engineReady = false;
   lastAsrText = '';
   lastTranslatedText = '';
@@ -99,7 +111,7 @@ async function startPipeline(nextSettings: Settings, tabId: number | null, strea
   if (streamId) {
     try {
       tabCaptureHandle = await startTabCapture(streamId);
-      emitStatus({ state: 'capturing' });
+      emitStatus({ state: lastError && !engineReady ? 'engine-offline' : 'capturing' });
       sendSubtitle('Tab audio capture is active. Waiting for translated text...');
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
@@ -119,8 +131,9 @@ function stopPipeline(): void {
   startedAt = null;
   segmentSamples = [];
   segmentFrames = 0;
-  segmentStartedAt = 0;
   segmentBusy = false;
+  segmentReady = false;
+  silenceSegmenter.reset();
   engineReady = false;
   lastAsrText = '';
   lastTranslatedText = '';
@@ -143,15 +156,21 @@ function onPcm(samples: ArrayLike<number>, sampleRate: number, rms: number, peak
     peak,
     lastChunkAt: now,
   };
-  emitStatus({ state: 'streaming' });
-  appendSegment(samples instanceof Float32Array ? samples : new Float32Array(samples), sampleRate);
+  emitStatus(engineReady && engine?.connected ? { state: 'streaming' } : {});
+  appendSegment(
+    samples instanceof Float32Array ? samples : new Float32Array(samples),
+    sampleRate,
+    rms,
+    peak,
+  );
   if (capture.chunks % 12 === 0 && !lastTranslatedText) {
     sendSubtitle(`Capturing tab audio: ${formatSeconds(capture.durationMs)}. Waiting for translated text...`);
   }
 }
 
 function emitStatus(patch: Partial<RuntimeStatus> = {}): void {
-  const state = patch.state ?? (capture.chunks > 0 ? 'streaming' : settings ? 'ready' : 'idle');
+  if (patch.state) pipelineState = patch.state;
+  const state = patch.state ?? pipelineState;
   const status: RuntimeStatus = {
     state,
     engineConnected: engineReady && Boolean(engine?.connected),
@@ -159,7 +178,7 @@ function emitStatus(patch: Partial<RuntimeStatus> = {}): void {
     sourceLang: settings?.sourceLang ?? 'en',
     targetLang: settings?.targetLang ?? 'zh',
     lagMs: 0,
-    queueDepth: segmentBusy ? 1 : 0,
+    queueDepth: Number(segmentBusy) + Number(segmentReady),
     capture,
     asrText: lastAsrText,
     translatedText: lastTranslatedText,
@@ -206,6 +225,11 @@ async function connectEngine(): Promise<void> {
     scheduleEngineReconnect();
   });
   try {
+    emitStatus({ state: 'checking-engine', engineConnected: false, error: null });
+    const health = await client.checkHealth();
+    if (engine !== client) return;
+    const modelError = describeModelHealthError(health);
+    if (modelError) throw new Error(modelError);
     await client.connect();
     if (engine !== client) {
       client.close();
@@ -215,6 +239,7 @@ async function connectEngine(): Promise<void> {
     lastError = null;
     emitStatus({ state: 'ready', engineConnected: true });
     sendSubtitle('Local engine connected. Capturing audio...');
+    maybeTranslateBufferedSegment();
   } catch (error) {
     if (engine !== client) return;
     engine = null;
@@ -248,22 +273,38 @@ function scheduleEngineReconnect(): void {
   }, ENGINE_RECONNECT_MS);
 }
 
-function appendSegment(samples: Float32Array, sampleRate: number): void {
+function appendSegment(
+  samples: Float32Array,
+  sampleRate: number,
+  rms: number,
+  peak: number,
+): void {
   if (!settings || sampleRate !== 16000) return;
-  if (!segmentStartedAt) segmentStartedAt = performance.now();
   segmentSamples.push(samples);
   segmentFrames += samples.length;
   let durationMs = (segmentFrames / sampleRate) * 1000;
-  if (durationMs > MAX_SEGMENT_MS) {
-    trimSegmentBuffer(Math.round((sampleRate * MAX_SEGMENT_MS) / 1000));
+  if (durationMs > MAX_BUFFER_MS) {
+    trimSegmentBuffer(Math.round((sampleRate * MAX_BUFFER_MS) / 1000));
     durationMs = (segmentFrames / sampleRate) * 1000;
     if (!engineReady || !engine?.connected) {
       sendSubtitle(`Local engine is offline. Keeping only the latest ${formatSeconds(durationMs)} of audio...`);
     }
   }
-  if (!segmentBusy && engineReady && engine?.connected && durationMs >= SEGMENT_MS) {
-    const merged = drainSegment();
-    void translateSegment(merged, sampleRate, durationMs);
+
+  if (segmentReady) return;
+  const action = silenceSegmenter.observe(
+    rms,
+    peak,
+    (samples.length / sampleRate) * 1000,
+    durationMs,
+  );
+  if (action.kind === 'trim-idle') {
+    trimSegmentBuffer(Math.round((sampleRate * action.keepMs) / 1000));
+    return;
+  }
+  if (action.kind === 'flush') {
+    segmentReady = true;
+    maybeTranslateBufferedSegment(sampleRate);
   }
 }
 
@@ -293,8 +334,24 @@ function drainSegment(): Float32Array {
   }
   segmentSamples = [];
   segmentFrames = 0;
-  segmentStartedAt = 0;
+  segmentReady = false;
+  silenceSegmenter.reset();
   return merged;
+}
+
+function maybeTranslateBufferedSegment(sampleRate = 16000): void {
+  if (
+    segmentBusy ||
+    !segmentReady ||
+    !engineReady ||
+    !engine?.connected ||
+    segmentFrames < (sampleRate * MIN_SEGMENT_MS) / 1000
+  ) {
+    return;
+  }
+  const durationMs = (segmentFrames / sampleRate) * 1000;
+  const merged = drainSegment();
+  void translateSegment(merged, sampleRate, durationMs);
 }
 
 async function translateSegment(samples: Float32Array, sampleRate: number, durationMs: number): Promise<void> {
@@ -304,7 +361,7 @@ async function translateSegment(samples: Float32Array, sampleRate: number, durat
   const sessionId = `voxflow-${Date.now()}-${sessionSeq++}`;
   try {
     engine.send({
-      v: PROTOCOL_VERSION,
+      v: LOCAL_ENGINE_PROTOCOL_VERSION,
       type: 'session.start',
       sessionId,
       requestId: `${sessionId}-start`,
@@ -343,7 +400,7 @@ async function translateSegment(samples: Float32Array, sampleRate: number, durat
       const chunk = samples.subarray(offset, Math.min(samples.length, offset + chunkFrames));
       const chunkDurationMs = Math.round((chunk.length / sampleRate) * 1000);
       engine.send({
-        v: PROTOCOL_VERSION,
+        v: LOCAL_ENGINE_PROTOCOL_VERSION,
         type: 'audio.chunk',
         sessionId,
         requestId: `${sessionId}-audio-${seq}`,
@@ -370,7 +427,7 @@ async function translateSegment(samples: Float32Array, sampleRate: number, durat
       seq += 1;
     }
     engine.send({
-      v: PROTOCOL_VERSION,
+      v: LOCAL_ENGINE_PROTOCOL_VERSION,
       type: 'audio.end',
       sessionId,
       requestId: `${sessionId}-audio-end`,
@@ -390,6 +447,11 @@ async function translateSegment(samples: Float32Array, sampleRate: number, durat
 function onEngineMessage(message: LocalEngineServerMessage): void {
   switch (message.type) {
     case 'engine.status':
+      if (message.state === 'loading') {
+        emitStatus({ state: 'loading-models', engineConnected: true, error: null });
+        sendSubtitle(message.message ?? 'Loading local AI models...');
+        break;
+      }
       if (message.state === 'stopped') segmentBusy = false;
       if (message.state === 'error') {
         segmentBusy = false;
@@ -399,11 +461,7 @@ function onEngineMessage(message: LocalEngineServerMessage): void {
         break;
       }
       emitStatus({ state: capture.chunks > 0 ? 'streaming' : 'ready', engineConnected: true });
-      if (!segmentBusy && segmentFrames >= (16000 * SEGMENT_MS) / 1000 && engine?.connected) {
-        const durationMs = (segmentFrames / 16000) * 1000;
-        const merged = drainSegment();
-        void translateSegment(merged, 16000, durationMs);
-      }
+      maybeTranslateBufferedSegment();
       break;
     case 'asr.final':
       lastAsrText = message.text;
@@ -455,6 +513,16 @@ function normalizeLang(lang: Settings['sourceLang'] | Settings['targetLang']): s
 
 function formatSeconds(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function describeModelHealthError(health: EngineHealthResponse): string | null {
+  const unavailable = (['asr', 'mt'] as const)
+    .filter((stage) => !health.models[stage].ready)
+    .map((stage) => {
+      const missing = health.models[stage].missing.join(', ');
+      return `${stage.toUpperCase()}${missing ? ` missing ${missing}` : ' unavailable'}`;
+    });
+  return unavailable.length > 0 ? `Local engine models are not ready: ${unavailable.join('; ')}` : null;
 }
 
 interface TabCaptureHandle {

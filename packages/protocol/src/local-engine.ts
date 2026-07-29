@@ -1,4 +1,5 @@
 export type ProtocolVersion = 'voxflow.local.v1';
+export const LOCAL_ENGINE_PROTOCOL_VERSION: ProtocolVersion = 'voxflow.local.v1';
 
 export type PipelineStage = 'asr' | 'mt' | 'tts';
 export type LatencyMode = 'realtime' | 'balanced' | 'quality';
@@ -160,6 +161,17 @@ export interface EngineStatusEvent extends ServerEnvelope {
   message?: string;
 }
 
+export interface AudioStatsEvent extends ServerEnvelope {
+  type: 'audio.stats';
+  streamId: string;
+  chunks: number;
+  bytes: number;
+  samples: number;
+  durationMs: number;
+  rms: number;
+  peak: number;
+}
+
 export interface AsrFinalEvent extends ServerEnvelope {
   type: 'asr.final';
   segmentId: string;
@@ -258,9 +270,39 @@ export interface ErrorEvent extends ServerEnvelope {
 export type LocalEngineServerMessage =
   | SessionStartedEvent
   | EngineStatusEvent
+  | AudioStatsEvent
   | AsrFinalEvent
   | MtFinalEvent
   | TtsAudioEvent
   | TtsFinalEvent
   | ResultFinalEvent
   | ErrorEvent;
+
+export interface ModelHealth {
+  ready: boolean;
+  path: string;
+  missing: string[];
+}
+
+export interface EngineHealthResponse {
+  service: 'voxflow-local-engine';
+  version: string;
+  protocol: ProtocolVersion;
+  status: 'ok' | 'degraded';
+  modelState: 'cold' | 'partial' | 'ready';
+  models: {
+    asr: ModelHealth;
+    mt: ModelHealth;
+    tts: ModelHealth;
+  };
+  capabilities: {
+    stages: PipelineStage[];
+    inputSampleFormats: InputSampleFormat[];
+    sourceLanguages: string[];
+    targetLanguages: string[];
+  };
+  security: {
+    tokenRequired: boolean;
+    originPolicyEnabled: boolean;
+  };
+}

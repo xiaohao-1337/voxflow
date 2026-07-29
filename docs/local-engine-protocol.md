@@ -14,6 +14,26 @@ ws://127.0.0.1:8765/ws
 
 ## 1. 基础约定
 
+### 1.1 健康检查与连接安全
+
+客户端在建立 WebSocket 前可请求：
+
+```text
+GET http://127.0.0.1:8765/health
+```
+
+响应包含协议版本、支持 stages / 音频格式、ASR / MT / TTS 模型文件状态，以及进程内模型的 `cold | partial | ready` 加载状态。扩展会先检查 ASR 与 MT 文件，再建立 `/ws` 连接。
+
+浏览器请求默认只允许 `chrome-extension://*` 和 `moz-extension://*` Origin；可通过 `VOXFLOW_ALLOWED_ORIGINS` 收紧为精确扩展 ID。配置 `VOXFLOW_LOCAL_ENGINE_TOKEN` 后，`/health` 与 `/ws` 都要求：
+
+```text
+?token=SHARED_TOKEN
+```
+
+HTTP 诊断工具也可使用 `Authorization: Bearer SHARED_TOKEN`。Token 默认不启用，服务仍必须只绑定回环地址。
+
+### 1.2 WebSocket envelope
+
 所有消息都是 JSON object，必须包含：
 
 ```json
@@ -89,7 +109,7 @@ ws://127.0.0.1:8765/ws
       "mode": "segment"
     },
     "mt": {
-      "provider": "argos",
+      "provider": "huggingface",
       "sourceLang": "en",
       "targetLang": "zh"
     }
@@ -149,12 +169,14 @@ ws://127.0.0.1:8765/ws
 
 ```json
 {
-  "provider": "argos | libretranslate | ctranslate2",
+  "provider": "huggingface",
   "model": "可选，本地模型路径或模型名",
   "sourceLang": "en",
   "targetLang": "zh"
 }
 ```
+
+当前运行时只实现 `huggingface` MarianMT。`argos`、`libretranslate` 与 `ctranslate2` 名称仍保留在共享类型中供后续演进，但请求这些 provider 会返回 `mt_provider_unavailable`，不会静默回退。
 
 ### 3.3 TTS
 
@@ -429,7 +451,13 @@ TTS 完成：
 }
 ```
 
-### 6.2 media.state
+网关在模型加载前先发送 `state=loading, stage=asr`，加载完成后发送 `ready`；收到 `audio.end` 并进入推理时发送 `running`，完成或失败后发送 `stopped` / `error`。因此客户端不应把 WebSocket `open` 等同于模型已经加载。
+
+### 6.2 audio.stats
+
+服务端约每累计 1000ms 音频发送一次聚合统计，并在 `audio.end` 时补发尚未上报的尾段。统计事件不是逐 chunk ack，客户端不得依赖它确认每个分片。
+
+### 6.3 media.state
 
 用于同步视频播放状态：
 
@@ -444,7 +472,7 @@ TTS 完成：
 }
 ```
 
-### 6.3 session.cancel / session.close
+### 6.4 session.cancel / session.close
 
 ```json
 {
@@ -493,5 +521,7 @@ TTS 完成：
 | `asr.final` / `mt.final` | 已实现 |
 | `result.final` | 已实现 `kind=asr` 与 `kind=text` |
 | `tts.audio` | 协议已定义，推理引擎尚未接入；请求时返回 `tts_unavailable` |
+| `/health` | 已实现模型文件、加载状态和能力清单 |
+| Token / Origin | 已实现可选共享 Token 和浏览器 Origin 白名单 |
 
-服务端会校验 `sessionId`、`streamId`、`seq`、Base64、字节数、帧数、采样率与声道数。旧版 `translation.final` 兼容事件已移除，客户端应消费 `mt.final` 或 `result.final`。
+服务端会校验协议版本、`sessionId`、`streamId`、`seq`、`audio.end.lastSeq`、Base64、字节数、帧数、采样率与声道数。旧版 `translation.final` 兼容事件已移除，客户端应消费 `mt.final` 或 `result.final`。

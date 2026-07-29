@@ -1,4 +1,11 @@
-import type { ControlMessage, PcmPortMessage, TabMessage } from './protocol';
+import {
+  isControlMessage,
+  isSessionPortMessage,
+  isTabMessage,
+  type ControlMessage,
+  type SessionPortMessage,
+  type TabMessage,
+} from './protocol';
 
 export async function sendControl(msg: ControlMessage): Promise<unknown> {
   return unwrapResponse(await chrome.runtime.sendMessage(msg));
@@ -12,8 +19,8 @@ export function onControlMessage(
     sender: chrome.runtime.MessageSender,
     sendResponse: (response?: unknown) => void,
   ) => {
-    if (!isProtocolMessage(msg)) return false;
-    const result = handler(msg as ControlMessage, sender);
+    if (!isControlMessage(msg)) return false;
+    const result = handler(msg, sender);
     if (result instanceof Promise) {
       result.then(sendResponse, (error) => sendResponse({ __voxflowError: serializeError(error) }));
       return true;
@@ -36,8 +43,8 @@ export function onTabMessage(
     sender: chrome.runtime.MessageSender,
     sendResponse: (response?: unknown) => void,
   ) => {
-    if (!isProtocolMessage(msg)) return false;
-    const result = handler(msg as TabMessage, sender);
+    if (!isTabMessage(msg)) return false;
+    const result = handler(msg, sender);
     if (result instanceof Promise) {
       result.then(sendResponse, (error) => sendResponse({ __voxflowError: serializeError(error) }));
       return true;
@@ -48,18 +55,21 @@ export function onTabMessage(
   return () => chrome.runtime.onMessage.removeListener(listener);
 }
 
-export interface PcmPort {
+export interface SessionPort {
   readonly raw: chrome.runtime.Port;
-  post(msg: PcmPortMessage): void;
-  on(handler: (msg: PcmPortMessage) => void): () => void;
+  post(msg: SessionPortMessage): void;
+  on(handler: (msg: SessionPortMessage) => void): () => void;
   onDisconnect(handler: (error?: chrome.runtime.LastError) => void): void;
 }
 
-export function connectPcmPort(name: string): PcmPort {
+export function connectSessionPort(name: string): SessionPort {
   return wrapPort(chrome.runtime.connect({ name }));
 }
 
-export function onPcmPortConnect(expectedName: string, handler: (port: PcmPort) => void): () => void {
+export function onSessionPortConnect(
+  expectedName: string,
+  handler: (port: SessionPort) => void,
+): () => void {
   const listener = (port: chrome.runtime.Port) => {
     if (port.name === expectedName) handler(wrapPort(port));
   };
@@ -67,7 +77,7 @@ export function onPcmPortConnect(expectedName: string, handler: (port: PcmPort) 
   return () => chrome.runtime.onConnect.removeListener(listener);
 }
 
-function wrapPort(port: chrome.runtime.Port): PcmPort {
+function wrapPort(port: chrome.runtime.Port): SessionPort {
   return {
     raw: port,
     post(msg) {
@@ -75,7 +85,7 @@ function wrapPort(port: chrome.runtime.Port): PcmPort {
     },
     on(handler) {
       const listener = (msg: unknown) => {
-        if (isProtocolMessage(msg)) handler(msg as PcmPortMessage);
+        if (isSessionPortMessage(msg)) handler(msg);
       };
       port.onMessage.addListener(listener);
       return () => port.onMessage.removeListener(listener);
@@ -84,10 +94,6 @@ function wrapPort(port: chrome.runtime.Port): PcmPort {
       port.onDisconnect.addListener(() => handler(chrome.runtime.lastError));
     },
   };
-}
-
-function isProtocolMessage(msg: unknown): msg is { kind: string } {
-  return Boolean(msg && typeof msg === 'object' && 'kind' in msg);
 }
 
 function serializeError(error: unknown): string {

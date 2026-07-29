@@ -23,6 +23,16 @@ export function App() {
         <input value={settings.localEngineUrl} onChange={(event) => void update({ localEngineUrl: event.target.value })} />
       </label>
       <label>
+        Local engine token
+        <input
+          type="password"
+          autoComplete="off"
+          placeholder="Optional shared token"
+          value={settings.localEngineToken}
+          onChange={(event) => void update({ localEngineToken: event.target.value })}
+        />
+      </label>
+      <label>
         Source language
         <select value={settings.sourceLang} onChange={(event) => void update({ sourceLang: event.target.value as Settings['sourceLang'] })}>
           <option value="en">English (current)</option>

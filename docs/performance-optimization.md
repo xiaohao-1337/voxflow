@@ -9,7 +9,7 @@
 ```text
 48kHz 标签页音频
   -> AudioWorklet 线性降采样到 16kHz mono
-  -> offscreen 缓冲约 7 秒
+  -> offscreen 静音感知分段（1.2-7 秒）
   -> 200ms Float32 PCM + JSON Base64 WebSocket
   -> 本地服务累积整段音频
   -> FunASR 离线段识别
@@ -17,7 +17,7 @@
   -> 网页文本浮层
 ```
 
-当前延迟的最大来源不是 WebSocket，而是“固定约 7 秒分段 + 整段 ASR”。即使模型推理速度很快，用户也需要先等待音频段收满。因此，降低首条译文延迟时，应优先改分段与 ASR 模式，而不是先调整网络参数。
+当前浏览器侧已经用自适应能量阈值、240ms pre-roll 和 450ms 句尾静音替代固定 7 秒提交，连续声音仍在 7 秒强制切段。最大延迟来源仍不是 WebSocket，而是“等待语音段结束 + 整段 ASR”。因此下一步应优先接入模型 VAD 与增量 ASR，而不是先调整网络参数。
 
 已经具备的保护措施：
 
@@ -30,6 +30,9 @@
 | 模型实例 | ASR 与 MT 均缓存，避免每段重复加载 |
 | 连接恢复 | 扩展断线后自动重连本地服务 |
 | 协议校验 | 校验 session、stream、seq、Base64、字节数与帧数 |
+| Worklet 缓冲 | 固定 TypedArray 输出帧，无 `push` / `splice` |
+| 统计事件 | 约每 1 秒聚合，并在分段结束时补发 |
+| Readiness | `/health` 区分模型文件和冷/热加载状态 |
 
 ## 2. 建议性能目标
 
@@ -105,7 +108,7 @@ cd apps/local-ai-server
 
 ## 4. P0：最优先优化项
 
-### 4.1 用 VAD 替代固定 7 秒分段
+### 4.1 用模型 VAD 替换能量启发式
 
 涉及文件：
 
@@ -113,7 +116,7 @@ cd apps/local-ai-server
 - `apps/local-ai-server/src/pipeline/vad_segmenter.py`
 - `apps/local-ai-server/src/ws/session.py`
 
-当前固定 7 秒才提交识别，是首条译文延迟的主要来源。建议将持续 PCM 流交给服务端 VAD：
+当前浏览器启发式已经能在句尾静音时提前提交，但音乐、稳定背景噪声和音量很低的人声仍可能误判。建议将持续 PCM 流交给服务端模型 VAD：
 
 1. 20-30ms 音频帧进入 VAD。
 2. 检测到 speech-start 后开始语音段。
@@ -123,7 +126,7 @@ cd apps/local-ai-server
 
 优先评估 FunASR FSMN-VAD；若模型部署复杂，再评估 Silero VAD。能量阈值只适合调试，不适合作为正式方案。
 
-预期收益：常规句子的提交等待可从固定 7 秒降低到“句尾停顿 + 300-600ms”。
+预期收益：在保留当前“句尾停顿 + 约 450ms”体验的同时，提高复杂音频中的切段准确率，并为服务端连续流和 partial ASR 建立边界。
 
 ### 4.2 接入流式或增量 ASR
 
@@ -156,12 +159,11 @@ magic(4) + version(1) + flags(1) + seq(4) + timestamp(8)
 
 涉及文件：`apps/extension/src/public/voxflow-pcm-capture.worklet.js`
 
-当前 worklet 使用普通 JS 数组和 `splice(0, n)`。这会在实时音频线程中频繁移动数组元素并产生 GC 压力。建议：
+当前 worklet 已改用跨 render quantum 的重采样状态和固定 `Float32Array` 输出帧，不再使用普通数组或 `splice(0, n)`。后续仍应通过长时间运行验证：
 
-- 使用预分配 `Float32Array` 环形缓冲区。
-- 使用读写游标，不调用 `push`、`shift`、`splice`。
 - 每次只在凑够输出帧时创建可转移的结果 buffer。
-- 将 30ms 帧直接 transfer 给 offscreen，避免结构化克隆。
+- 30ms 帧继续直接 transfer 给 offscreen，避免结构化克隆。
+- 关注长时间运行中的 GC、render quantum 抖动和采样连续性。
 
 验收方式：连续播放 30 分钟，AudioWorklet 无长任务，页面声音无爆音，扩展进程内存不持续爬升。
 
@@ -184,13 +186,15 @@ capture queue -> VAD queue -> ASR worker -> MT worker -> TTS worker -> playback 
 
 ### 5.1 模型预热与健康检查
 
-服务启动后可选择执行 0.5-1 秒静音/测试文本预热，并提供独立状态：
+当前 `/health` 已返回模型文件、能力和 `cold | partial | ready` 进程加载状态，网关也会在会话中发送 `loading → ready → running → stopped/error`。扩展不再把 WebSocket `open` 直接视为模型已加载。
+
+下一步是在服务启动后可选执行 0.5-1 秒静音/测试文本预热，并增加独立状态：
 
 ```text
 loading -> warming -> ready
 ```
 
-这样扩展不会把“WebSocket 已连接”误认为“模型已准备好”。建议增加 `/health` 或 WebSocket `engine.capabilities`，返回模型路径、设备、支持语言、是否已预热和当前队列深度。
+现有健康响应还需要补充预热耗时、设备和当前队列深度，并把文件完整与可成功推理解耦为不同检查。
 
 ### 5.2 移除临时 WAV 与 Python 逐样本转换
 
@@ -232,7 +236,7 @@ f32 bytes -> Python float 循环 -> PCM16 -> 临时 WAV -> FunASR
 
 ### 5.5 降低统计事件频率
 
-当前每个 200ms 音频 chunk 都返回一次 `audio.stats`。生产模式可改为每 500-1000ms 聚合一次，debug 模式才逐包返回。这样可减少 WebSocket 消息数、JSON 解析和扩展状态广播。
+当前 `audio.stats` 已改为约每 1000ms 聚合一次，并在分段结束时补发最后状态。后续可让 debug 模式选择逐包返回，并建立消息数与 CPU 开销基线。
 
 ### 5.6 独立推理进程
 
@@ -277,16 +281,16 @@ f32 bytes -> Python float 循环 -> PCM16 -> 临时 WAV -> FunASR
 
 ### 阶段 B：降低首条译文延迟
 
-1. 接入 VAD。
-2. 将固定 7 秒分段改为自然句段。
+1. 接入模型 VAD。
+2. [已完成过渡实现] 用静音感知替代固定 7 秒提交。
 3. 增加 partial ASR 字幕。
 
 ### 阶段 C：降低 CPU 与内存
 
-1. AudioWorklet 环形缓冲。
+1. [已完成基础优化] AudioWorklet 固定缓冲与无 `splice` 重采样。
 2. 二进制 PCM16 WebSocket。
 3. NumPy 直接输入 FunASR。
-4. `audio.stats` 降频。
+4. [已完成] `audio.stats` 降频。
 
 ### 阶段 D：提高模型吞吐
 

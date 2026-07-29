@@ -50,6 +50,10 @@ def get_funasr_engine(config: FunAsrConfig) -> "FunAsrEngine":
     return engine
 
 
+def has_loaded_funasr_engine() -> bool:
+    return bool(_ENGINE_CACHE)
+
+
 class FunAsrEngine:
     def __init__(self, config: FunAsrConfig | None = None) -> None:
         self.config = config or FunAsrConfig()

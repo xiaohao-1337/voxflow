@@ -28,7 +28,7 @@
 VoxFlow 是一个本地优先的网页视频语音翻译项目。浏览器扩展负责捕获标签页音频与展示双语文本，本地 AI 服务负责 FunASR 语音识别和 MarianMT 机器翻译。项目的最终目标，是提供一套可本地部署、低成本、隐私友好的网页视频实时同传配音方案。
 
 > [!IMPORTANT]
-> 当前版本已经跑通 **网页音频捕获 → 英文语音识别 → 简体中文翻译 → 网页双语浮层**。当前采用约 7 秒音频分段，属于近实时文本翻译；VAD、真正的流式 ASR、TTS 中文语音与音画同步播放仍在开发中。
+> 当前版本已经跑通 **网页音频捕获 → 英文语音识别 → 简体中文翻译 → 网页双语浮层**。浏览器侧会保留短 pre-roll，并在约 450 ms 句尾静音或 7 秒上限时提交；模型 VAD、真正的流式 ASR、TTS 中文语音与音画同步播放仍在开发中。
 
 如果你也希望看外语课程、访谈、直播和短视频时，不必把音频交给云端服务，欢迎点一个 [Star](https://github.com/xiaohao-1337/voxflow/stargazers)。每一个 Star 都会让这个方向被更多本地 AI 和无障碍技术爱好者看到。
 
@@ -53,7 +53,10 @@ VoxFlow 是一个本地优先的网页视频语音翻译项目。浏览器扩展
 | 网页双语浮层 | ✅ 已实现 | 展示英文识别结果和中文译文 |
 | 本地 WebSocket 协议 | ✅ 已实现 | `voxflow.local.v1`，JSON + Base64 PCM |
 | 服务断线重连 | ✅ 已实现 | 扩展每 2 秒尝试重连 |
-| VAD / 增量 ASR | 🚧 规划中 | 当前固定约 7 秒成段 |
+| 健康检查与模型校验 | ✅ 已实现 | `/health` + 本地模型完整性脚本 |
+| 本地网关安全基线 | ✅ 已实现 | 浏览器 Origin 白名单 + 可选共享 Token |
+| 静音感知分段 | ✅ 已实现 | 240 ms pre-roll、450 ms 句尾静音、7 秒上限 |
+| 模型 VAD / 增量 ASR | 🚧 规划中 | 当前能量启发式仍由整段 ASR 处理 |
 | 中文 TTS | 🚧 规划中 | 请求 TTS 时明确返回 `tts_unavailable` |
 | 译文语音同步播放 | 🚧 规划中 | 播放、时间戳、队列文件目前为骨架 |
 
@@ -71,7 +74,7 @@ flowchart LR
   Video["网页视频 / 标签页音频"] --> Capture["chrome.tabCapture"]
   Capture --> Offscreen["Offscreen Document"]
   Offscreen --> Worklet["AudioWorklet<br/>48 kHz → 16 kHz mono"]
-  Worklet --> Segment["约 7 秒 PCM 分段"]
+  Worklet --> Segment["静音感知的 1.2～7 秒 PCM 分段"]
   Segment --> WS["WebSocket<br/>voxflow.local.v1"]
   WS --> ASR["FunASR<br/>SenseVoiceSmall"]
   ASR --> MT["MarianMT<br/>English → Chinese"]
@@ -192,13 +195,17 @@ Set-Location ..\..
 macOS / Linux：
 
 ```bash
-apps/local-ai-server/.venv/bin/python -c "from modelscope import snapshot_download; snapshot_download('iic/SenseVoiceSmall', local_dir='models/asr/SenseVoiceSmall')"
+cd apps/local-ai-server
+.venv/bin/python scripts/download_asr.py
+cd ../..
 ```
 
 Windows PowerShell：
 
 ```powershell
-apps\local-ai-server\.venv\Scripts\python -c "from modelscope import snapshot_download; snapshot_download('iic/SenseVoiceSmall', local_dir='models/asr/SenseVoiceSmall')"
+Set-Location apps\local-ai-server
+.\.venv\Scripts\python scripts\download_asr.py
+Set-Location ..\..
 ```
 
 下载完成后，至少应存在：
@@ -234,6 +241,13 @@ Windows PowerShell 将 `.venv/bin/python` 替换为 `.\.venv\Scripts\python`。
 > [!TIP]
 > 当前推理只使用 PyTorch 权重。若采用 Git LFS 方式，无需额外拉取 `tf_model.h5`、`flax_model.msgpack` 和 `rust_model.ot`。
 
+完成 ASR / MT 准备后，可一次检查必需文件、权重大小和 Git LFS pointer：
+
+```bash
+cd apps/local-ai-server
+.venv/bin/python scripts/check_models.py
+```
+
 ### 6. 启动本地 AI 服务
 
 macOS / Linux：
@@ -254,9 +268,20 @@ Set-Location apps/local-ai-server
 
 ```text
 voxflow-local-engine listening on ws://127.0.0.1:8765/ws
+health check available at http://127.0.0.1:8765/health
 ```
 
-保持这个终端窗口运行。模型会在收到首个会话时加载，因此“服务已监听”不代表模型已经完成预热。
+保持这个终端窗口运行。访问 `http://127.0.0.1:8765/health` 可以查看模型文件和冷/热加载状态。模型仍会在收到首个会话时惰性加载。
+
+可选安全配置：
+
+```bash
+export VOXFLOW_LOCAL_ENGINE_TOKEN='replace-with-a-long-random-token'
+export VOXFLOW_ALLOWED_ORIGINS='chrome-extension://你的扩展ID'
+.venv/bin/python -m src.main
+```
+
+启用 Token 后，还需在扩展 Options 的 **Local engine token** 中填写同一个值。
 
 ### 7. 用终端先验证模型
 
@@ -310,6 +335,7 @@ Windows PowerShell：
 
 ```bash
 npm run compile
+npm test
 npm run build
 ```
 
@@ -338,7 +364,7 @@ dist/extension/chrome-mv3
 5. 点击 **Start**。
 6. Popup 的状态应从 `checking-engine` / `capturing` 进入 `streaming`。
 7. `Audio` 分片数、RMS 和 Peak 应持续变化。
-8. 等待至少一个约 7 秒分段，加上本机模型推理时间。
+8. 等待一句语音后的短暂停顿；连续声音最晚会在约 7 秒上限切段，再加上本机模型推理时间。
 9. 网页底部会出现 VoxFlow 浮层，先显示英文识别文本，再显示中文译文。
 10. 使用完成后点击 **Stop**，释放标签页音频流和本地连接。
 
@@ -347,14 +373,14 @@ dist/extension/chrome-mv3
 > [!WARNING]
 > `chrome.tabCapture` 接管标签页音频后，当前实现不会把原声重新送到扬声器，因此点击 Start 后原视频会静音。这是为未来“只播放译文语音”准备的行为；当前 TTS 尚未实现。
 
-### 修改本地服务地址
+### 修改本地服务连接
 
 默认地址为 `ws://127.0.0.1:8765/ws`，一般无需修改。需要调整时：
 
 1. 打开 `chrome://extensions`。
 2. 找到 VoxFlow 并点击“详细信息”。
 3. 打开“扩展程序选项”。
-4. 修改 **Local engine URL**。
+4. 修改 **Local engine URL**；如果服务启用了 Token，同时填写 **Local engine token**。
 
 当前稳定语向固定为英文到简体中文，Options 中其他语言尚未开放。
 
@@ -438,7 +464,7 @@ npm run zip
 
 ### 有音频指标，但迟迟没有译文
 
-- 当前需要先累计约 7 秒音频，再执行整段 ASR 和翻译。
+- 当前会等待句尾静音或 7 秒上限，再执行整段 ASR 和翻译。
 - 第一次模型冷启动会更慢，请先用终端客户端验证。
 - 确认源音频主要为清晰英文语音；音乐、长静音和多人重叠说话会降低效果。
 - 查看本地服务终端是否出现 `asr_failed`、`asr_empty` 或 `mt_failed`。
@@ -466,8 +492,8 @@ voxflow/
 │   └── models/mt/               # Git LFS 跟踪的翻译模型
 ├── models/                      # 用户本地 ASR / MT / TTS 模型目录
 ├── packages/
-│   ├── audio/                   # 共享音频工具，部分仍为骨架
-│   └── protocol/                # 共享协议类型，正在与扩展内类型收敛
+│   ├── audio/                   # PCM、线性重采样和 WAV 基础工具
+│   └── protocol/                # 本地引擎协议类型的单一事实来源
 ├── docs/                        # 协议与性能文档
 ├── infra/                       # 后续部署骨架
 ├── ARCHITECTURE.md              # 当前架构、数据流与演进边界
@@ -478,12 +504,12 @@ voxflow/
 ## 当前限制
 
 - 当前稳定语向仅为英文语音到简体中文文本。
-- 当前固定约 7 秒音频分段，不是词级或句级的流式识别。
+- 当前是浏览器侧静音/能量启发式分段，不是模型 VAD，也不是词级流式识别。
 - ASR 会将整段音频写入临时 WAV 后调用 FunASR。
 - 音频使用 Float32 PCM + Base64 + JSON，带宽和编码开销尚未优化。
 - 服务端 AI 阶段由全局锁串行执行，更适合单用户而非多租户。
 - TTS、译文播放队列、延迟追赶与音画同步尚未实现。
-- 服务端尚未实现 token 校验、Origin 白名单、TLS 和健康检查。
+- Token 校验需要手工启用，默认 Origin 规则仍建议收紧到精确扩展 ID；TLS 尚未实现。
 - Firefox 脚本存在，但当前 `tabCapture` 主链路以 Chromium 为目标。
 - Netflix、Disney+ 等 DRM 内容不受支持。
 
@@ -497,13 +523,17 @@ voxflow/
 - [x] 网页双语文本浮层
 - [x] `voxflow.local.v1` 可组合管线协议
 - [x] 本地服务断线自动重连
-- [ ] VAD 驱动的自然语音分段
+- [x] 浏览器侧静音感知分段与有界 pre-roll
+- [x] 共享协议类型、消息边界与音频工具测试
+- [x] 模型文件检查、`/health` 与基础能力清单
+- [x] 可选 Token 与浏览器 Origin 校验
+- [ ] 服务端 FSMN-VAD / Silero 自然语音分段
 - [ ] 流式 / 增量 ASR 与 partial 字幕
 - [ ] 二进制 WebSocket 音频帧
 - [ ] Piper 或 CosyVoice 本地 TTS
 - [ ] 译文音频队列、时间戳同步和延迟追赶
-- [ ] 模型预热、健康检查与能力协商
-- [ ] Token / Origin 校验与本地服务安全加固
+- [ ] 模型预热与更完整的能力协商
+- [ ] Token 自动生成/分发与精确扩展 Origin
 - [ ] 一键模型下载、安装器与桌面伴随服务
 - [ ] 更多语向与硬件加速档位
 

@@ -1,6 +1,11 @@
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from huggingface_hub import snapshot_download
+
+from src.model_health import model_health
 
 
 def download_model() -> None:
@@ -13,7 +18,11 @@ def download_model() -> None:
         repo_id="Helsinki-NLP/opus-mt-en-zh",
         local_dir=str(target_dir),
     )
-    print("Download completed successfully.")
+    result = model_health(mt_model=target_dir)["mt"]
+    if not result["ready"]:
+        raise SystemExit(f"MT download is incomplete; missing: {', '.join(result['missing'])}")
+    print("MT download and integrity check completed successfully.")
+
 
 if __name__ == "__main__":
     download_model()

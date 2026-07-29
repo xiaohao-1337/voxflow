@@ -1,6 +1,6 @@
 # VoxFlow 架构说明
 
-> 最后更新：2026-07-28
+> 最后更新：2026-07-29
 >
 > 适用版本：`0.1.0` 当前工作树
 >
@@ -14,14 +14,14 @@ VoxFlow 是一个本地优先的网页视频语音翻译系统，由 Chrome / Ed
 chrome.tabCapture
   → Offscreen AudioWorklet
   → 16 kHz mono Float32 PCM
-  → 约 7 秒分段
+  → 静音感知的 1.2～7 秒分段
   → WebSocket voxflow.local.v1
   → FunASR SenseVoiceSmall
   → MarianMT English-to-Chinese
   → 网页双语文本浮层
 ```
 
-当前尚未实现 VAD、增量 ASR、TTS、译文音频播放和音画同步。本文会严格区分：
+当前已实现浏览器侧能量/静音启发式分段，但尚未实现模型 VAD、增量 ASR、TTS、译文音频播放和音画同步。本文会严格区分：
 
 - **当前实现**：代码已经进入实际运行路径。
 - **骨架 / 预留**：已有类型、目录或空实现，但没有进入产品链路。
@@ -75,18 +75,20 @@ English speech → English text → Simplified Chinese text
 | Offscreen Document | 已实现 | 承载捕获 AudioContext、WebSocket 和分段 |
 | AudioWorklet 降采样 | 已实现 | 48 kHz 左右输入转 16 kHz mono，30 ms 一帧 |
 | Content Script 字幕浮层 | 已实现 | 显示原文、译文和运行提示 |
-| 约 7 秒固定分段 | 已实现 | 1.2 秒最小段、12 秒离线保留上限 |
+| 静音感知分段 | 已实现 | 240 ms pre-roll、450 ms 句尾静音、1.2 秒最短、7 秒强制切段 |
 | 本地 WebSocket 网关 | 已实现 | Python `asyncio` 标准库实现 |
 | `voxflow.local.v1` | 已实现 | JSON 文本帧承载 Base64 PCM |
 | FunASR ASR | 已实现 | SenseVoiceSmall，整段临时 WAV 推理 |
 | MarianMT 英译中 | 已实现 | Transformers + PyTorch，本地模型 |
 | 服务断线重连 | 已实现 | Offscreen 每 2 秒重试 |
-| VAD | 骨架 | `vad_segmenter.py` 仅占位 |
+| 模型 VAD | 骨架 | 当前能量启发式不是 FSMN-VAD / Silero；`vad_segmenter.py` 仍占位 |
 | ASR partial / streaming | 协议预留 | 当前服务只产生 `asr.final` |
 | TTS | 骨架 | Piper / CosyVoice 文件为空实现，请求会失败 |
 | 音频播放与同步 | 骨架 | Player / Scheduler / Lag Manager 未接入 |
-| 共享 protocol package | 部分实现 | 类型已定义，但扩展仍使用内部副本 |
-| 共享 audio package | 部分实现 | PCM16 转换可用，重采样与 WAV 仍占位 |
+| 共享 protocol package | 已实现 | 本地引擎协议类型集中在 `packages/protocol`，扩展只保留兼容导出 |
+| 共享 audio package | 已实现基础工具 | PCM16 转换、线性重采样和 PCM16 WAV 编解码可用 |
+| 健康检查与模型校验 | 已实现 | `/health` 返回能力、模型文件和冷/热加载状态 |
+| 网关 Origin / Token 校验 | 已实现基础能力 | 默认限制扩展 Origin；Token 可选，尚未自动生成 |
 | Docker / 安装脚本 | 骨架 | `infra` 目录暂无可部署实现 |
 
 ## 3. 系统上下文
@@ -179,12 +181,12 @@ voxflow/
 | 扩展 Manifest 与构建输出 | `wxt.config.ts` |
 | 扩展设置与默认值 | `apps/extension/src/core/types.ts` |
 | 扩展内部消息 | `apps/extension/src/messaging/protocol.ts` |
-| 扩展使用的服务协议类型 | `apps/extension/src/core/engine/local-engine-protocol.ts` |
+| 扩展与客户端使用的服务协议类型 | `packages/protocol/src/local-engine.ts` |
 | 服务端协议行为 | `apps/local-ai-server/src/ws/session.py` |
 | 完整协议说明 | `docs/local-engine-protocol.md` |
 | 本地模型默认路径 | `apps/local-ai-server/src/config.py` |
 
-`packages/protocol/src/local-engine.ts` 是正在收敛的共享协议定义，但当前扩展没有导入它。任何协议变更必须同步检查扩展内部类型、共享包、服务端解析和协议文档，直到完成单一事实来源迁移。
+`apps/extension/src/core/engine/local-engine-protocol.ts` 只作为历史导入路径的兼容导出；协议类型的单一事实来源已经收敛到 `packages/protocol/src/local-engine.ts`。服务端仍以 Python 实现协议解析，因此协议变更必须同步检查共享类型、服务端解析、终端客户端和协议文档。
 
 ## 5. 浏览器扩展架构
 
@@ -237,7 +239,8 @@ Offscreen 是当前浏览器侧数据面的核心：
 - 创建 `AudioContext`、MediaStreamSource 和 AudioWorkletNode。
 - 收取 30 ms Float32 PCM 帧。
 - 统计 chunks、bytes、duration、RMS、Peak。
-- 累积约 7 秒音频。
+- 保留 240 ms pre-roll，并在句尾静音或 7 秒上限时成段。
+- 先调用 `/health` 检查模型文件、能力与安全配置。
 - 连接本地 WebSocket 服务。
 - 将每段拆成 200 ms `audio.chunk`。
 - 接收 ASR / MT 结果。
@@ -270,7 +273,7 @@ frameSize: 480 samples
 frameDuration: 30 ms
 ```
 
-当前 Worklet 使用普通数组和 `splice` 维护缓冲，功能正确但会产生复制与 GC 压力。后续应改为环形缓冲。
+当前 Worklet 使用跨 render quantum 的线性重采样状态和固定 `Float32Array` 输出帧，不再使用普通数组、`push` 或 `splice`。每凑够 480 samples 才分配并 transfer 一个结果 buffer。
 
 ### 5.5 Content Script
 
@@ -280,11 +283,11 @@ frameDuration: 30 ms
 
 - 在 `<all_urls>`、`document_idle` 注入。
 - 创建和更新 `SubtitleOverlay`。
-- 建立名为 `voxflow:pcm` 的 Runtime Port。
+- 建立名为 `voxflow:session` 的 Runtime Port。
 - 每 250 ms读取页面首个 `<video>` 的 `currentTime`、暂停状态和倍速。
 - 接收 Offscreen 发来的 `SUBTITLE`。
 
-名称为 `voxflow:pcm` 的 Port 是早期设计遗留。当前 `chrome.tabCapture` 主路径中的 PCM 不经过 Content Script；PCM 直接在 Offscreen 内产生和处理。这个 Port 实际只承载 ready、视频时间和字幕消息，后续应重命名以反映职责。
+PCM 不经过 Content Script；它直接在 Offscreen 内产生和处理。`voxflow:session` Port 只承载 ready、视频时间和字幕消息，旧 `PCM` 消息类型已经移除。
 
 Content Script 上报的 `VIDEO_TIME` 当前在 Offscreen 中被接收但丢弃，尚未进入 `media.state` 或播放同步逻辑。
 
@@ -300,10 +303,11 @@ Popup：
 Options 当前只开放：
 
 - Local engine URL。
+- 可选 Local engine token。
 - 英文源语言。
 - 简体中文目标语言。
 
-`Settings` 中还定义了 token、provider、延迟模式、播放缓冲、丢弃阈值和字幕选项，但多数尚未暴露或进入有效运行逻辑。
+`Settings` 中还定义了 provider、延迟模式、播放缓冲、丢弃阈值和字幕选项，但多数尚未暴露或进入有效运行逻辑。
 
 设置保存在：
 
@@ -385,23 +389,25 @@ flowchart TD
   Frame --> Segment["Offscreen segment buffer"]
 ```
 
-常量位于 Offscreen：
+分段常量位于 `core/audio/silence-segmenter.ts`，传输常量位于 Offscreen：
 
 | 常量 | 当前值 | 含义 |
 |---|---:|---|
-| `SEGMENT_MS` | 7000 ms | 达到后提交一个推理段 |
 | `MIN_SEGMENT_MS` | 1200 ms | 最短可提交段 |
-| `MAX_SEGMENT_MS` | 12000 ms | 引擎离线时只保留最近音频上限 |
+| `trailingSilenceMs` | 450 ms | 检测到句尾静音后提交 |
+| `preRollMs` | 240 ms | 语音开始前保留的上下文 |
+| `maxSegmentMs` | 7000 ms | 连续语音强制切段上限 |
+| `MAX_BUFFER_MS` | 12000 ms | 引擎离线/繁忙时的音频保留上限 |
 | `ENGINE_CHUNK_MS` | 200 ms | 向服务端发送的协议分包大小 |
 | `ENGINE_RECONNECT_MS` | 2000 ms | WebSocket 重连周期 |
 
-当前固定 7 秒分段是首条字幕延迟的最大来源。30 ms Worklet 帧和 200 ms 传输包并不等于流式 ASR，因为服务端只有在收到 `audio.end` 后才开始整段推理。
+当前用自适应噪声底限、RMS/Peak 和句尾静音做浏览器侧启发式分段；无语音时只保留 pre-roll，正常句子可早于 7 秒提交，连续声音在 7 秒强制切段。它能降低固定等待，但不是模型 VAD，音乐/噪声环境仍可能误判。30 ms Worklet 帧和 200 ms 传输包也不等于流式 ASR，因为服务端仍只在收到 `audio.end` 后开始整段推理。
 
 ### 7.2 传输编码
 
 扩展会：
 
-1. 合并 7 秒 Float32Array。
+1. 合并当前静音感知语音段的 Float32Array。
 2. 按 200 ms 切片。
 3. 直接读取小端 Float32 的字节视图。
 4. Base64 编码。
@@ -453,7 +459,9 @@ python -m src.main --host 127.0.0.1 --port 8765
 - 接收 masked WebSocket text frame。
 - 每个 TCP / WebSocket 连接创建一个 `LocalEngineSession`。
 - 最大 WebSocket frame 为 2 MiB。
-- 未实现扩展帧、压缩、ping/pong 管理和完整 RFC 边界能力。
+- 校验浏览器 Origin，并在配置 Token 时同时保护 `/health` 与 `/ws`。
+- 拒绝未 masked、分片和带扩展位的客户端帧，支持 ping/pong 控制帧。
+- 未实现扩展帧、压缩和完整 RFC 边界能力。
 - 所有 AI 启动与 finalize 任务通过全局 `AI_PIPELINE_LOCK` 串行。
 - 阻塞模型调用通过 `asyncio.to_thread` 移出事件循环。
 
@@ -485,11 +493,12 @@ stateDiagram-v2
 - 当前只接受单声道。
 - 同一 session 不能改变 sample rate、channels 或 sample format。
 - chunk `seq` 必须从 0 连续递增。
+- `audio.end` 的 stream ID 和 `lastSeq` 必须与接收状态一致。
 - 单个解码后 chunk 最大 1 MiB。
 - 单 session 最长 120 秒。
 - 支持 `f32le` 和 `pcm16le` 输入，内部归一为 `f32le`。
 
-扩展当前每个约 7 秒段创建新的 `sessionId`，在同一 WebSocket 连接上依次执行 `session.start → audio.chunk* → audio.end`。
+扩展当前为每个静音感知语音段创建新的 `sessionId`，在同一 WebSocket 连接上依次执行 `session.start → audio.chunk* → audio.end`。
 
 ### 8.4 ASR Provider
 
@@ -522,7 +531,7 @@ stateDiagram-v2
 
 模型在首次翻译时惰性加载，并以进程级单例缓存。翻译调用使用线程锁保护。
 
-MT provider 设置虽然允许 `huggingface`、`argos`、`libretranslate` 和 `ctranslate2`，当前 Session 并不会按 provider 分派；无论扩展传入哪个允许值，实际都进入 Hugging Face MarianMT 管线。`argos_engine.py` 只是兼容导出，LibreTranslate 与 CTranslate2 仍是占位文件。
+MT 当前只实现 `huggingface` provider。Session 会明确拒绝 `argos`、`libretranslate` 和 `ctranslate2`，不再静默回退到 MarianMT。`argos_engine.py` 只是兼容导出，LibreTranslate 与 CTranslate2 仍是占位文件。
 
 ### 8.6 当前并发模型
 
@@ -562,7 +571,7 @@ ws://127.0.0.1:8765/ws
 |---|---|
 | `session.started` | 已实现 |
 | `engine.status` | 已实现 |
-| `audio.stats` | 已实现，每个 chunk 返回一次 |
+| `audio.stats` | 已实现，约每 1 秒聚合一次，并在段结束时补发 |
 | `asr.final` | 已实现 |
 | `mt.final` | 已实现 |
 | `result.final(kind=asr/text)` | 已实现 |
@@ -606,11 +615,11 @@ STATUS
 Content Script 和 Offscreen 使用长连接 Port：
 
 ```text
-name: voxflow:pcm
-messages: READY / PCM / VIDEO_TIME / SUBTITLE / END
+name: voxflow:session
+messages: READY / VIDEO_TIME / SUBTITLE / END
 ```
 
-当前主路径实际只使用 `READY`、`VIDEO_TIME` 和 `SUBTITLE`。`PCM` 是旧的页面采集路径遗留。
+当前主路径使用 `READY`、`VIDEO_TIME` 和 `SUBTITLE`；`END` 保留为页面侧停止通知。
 
 ### 10.3 状态机
 
@@ -638,7 +647,7 @@ idle → checking-engine → capturing / ready → streaming
 streaming → idle
 ```
 
-`loading-models`、`playing` 和 `paused` 已定义但当前没有完整状态转移。
+`loading-models` 已接入服务端模型加载状态；`playing` 和 `paused` 仍没有完整状态转移。
 
 ## 11. 模型与文件布局
 
@@ -685,7 +694,7 @@ models/tts
 
 ### 12.1 当前已做到
 
-- 服务默认绑定 `127.0.0.1`。
+- 服务默认绑定 `127.0.0.1`，并拒绝非 loopback host。
 - 扩展默认连接 `ws://127.0.0.1:8765/ws`。
 - 推理完成后不保存长期音频文件。
 - ASR 临时 WAV 在 `finally` 中删除。
@@ -696,11 +705,11 @@ models/tts
 
 | 项目 | 当前状态 | 风险 |
 |---|---|---|
-| Token 校验 | 客户端能带 query token，服务端不校验 | 本机其他进程或页面可尝试连接 |
-| Origin 校验 | 未实现 | 恶意网页可能尝试访问本地 WebSocket |
+| Token 校验 | 已实现、默认未启用 | 需通过环境变量/启动参数与扩展 Options 配置同一 Token |
+| Origin 校验 | 已实现基础白名单 | 默认允许浏览器扩展 scheme；建议生产安装配置精确扩展 Origin |
 | TLS | 未实现 | 只适合回环地址 |
-| 健康检查 | 未实现 | 无法区分端口已监听与模型已就绪 |
-| 能力协商 | 未实现 | 客户端只能通过请求失败发现不支持能力 |
+| 健康检查 | 已实现 `/health` | 返回模型文件、冷/部分/热加载状态和能力 |
+| 能力协商 | 已实现基础能力清单 | 尚未协商协议降级或动态 provider 参数 |
 | 请求速率限制 | 未实现 | 本地端口可能被滥用 |
 | 结构化日志与脱敏 | 未实现 | 当前主要使用 print / 异常消息 |
 
@@ -708,10 +717,10 @@ models/tts
 
 ### 12.3 建议的安全演进顺序
 
-1. 校验 `Origin`，只允许已知扩展来源。
-2. 首次启动生成本地随机 token。
-3. 扩展通过 query 或首帧认证。
-4. 增加 `/health` 或 `engine.capabilities`。
+1. 将默认扩展 scheme 白名单收紧为已安装扩展的精确 Origin。
+2. 首次启动生成并安全持久化本地随机 token。
+3. 扩展与服务自动交换/保存 token，避免手工配置。
+4. 在现有 `/health` 能力清单上增加协议降级协商。
 5. 增加连接数、消息大小、速率和 session 时长限制。
 6. 仅在明确的远程部署模式下引入 TLS。
 
@@ -721,33 +730,31 @@ models/tts
 
 ```text
 首条译文延迟
-≈ 固定 7 秒采集
+≈ 句尾静音等待或 7 秒强制切段
  + ASR 冷启动 / 热推理
  + MT 冷启动 / 热推理
  + 协议和 UI 开销
 ```
 
-当前最大结构性延迟是固定分段，而不是 localhost WebSocket。
+当前最大结构性延迟仍是“等待语音段结束 + 整段 ASR”，而不是 localhost WebSocket。
 
 ### 13.2 当前性能瓶颈
 
-- 固定 7 秒后才调用整段 ASR。
+- 静音启发式仍可能在噪声/音乐中等到 7 秒上限，且服务只做整段 ASR。
 - Float32 + Base64 + JSON 增加约 33% 编码体积。
-- Worklet 普通数组 `splice` 会移动内存。
 - ASR 每段写临时 WAV。
-- 每个 audio chunk 都返回 `audio.stats`。
 - AI 全局锁将所有客户端串行化。
 - MT 使用通用 Transformers / PyTorch，尚未量化或转换 CTranslate2。
 - 冷启动没有显式预热。
 
 ### 13.3 优化优先级
 
-1. 服务端 VAD 和自然语音分段。
+1. 用服务端模型 VAD 替换浏览器能量启发式。
 2. 流式或增量 ASR，产生 `asr.partial`。
-3. 模型预热和 readiness / capabilities。
-4. Worklet 环形缓冲与更少复制。
+3. 在现有 readiness / capabilities 上增加模型预热。
+4. ~~Worklet 固定缓冲与更少复制。~~ 已完成基础优化。
 5. 二进制 WebSocket 帧。
-6. `audio.stats` 聚合采样。
+6. ~~`audio.stats` 聚合采样。~~ 已按约 1 秒聚合。
 7. 直接 waveform 推理，避免临时 WAV。
 8. MarianMT → CTranslate2 / 量化。
 9. 显式任务队列、取消和背压。
@@ -807,6 +814,7 @@ TypeScript：
 
 ```bash
 npm run compile
+npm test
 npm run build
 ```
 
@@ -817,13 +825,19 @@ cd apps/local-ai-server
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-单元测试当前覆盖：
+自动测试当前覆盖：
 
+- 扩展控制消息、Tab 消息与 Session Port 的运行时判别。
+- 静音 pre-roll、句尾切段和 7 秒强制切段。
+- 共享 PCM、重采样与 WAV 工具。
 - ASR + MT final 事件。
 - 音频 seq 顺序校验。
+- `audio.end` stream / lastSeq 校验。
 - 空音频错误。
 - FunASR 加载失败。
 - TTS 未实现时的明确错误。
+- Origin / Token 校验和 WebSocket frame 边界。
+- 模型文件与 Git LFS pointer 完整性检查。
 
 ### 15.2 终端端到端验证
 
@@ -838,7 +852,7 @@ cd apps/local-ai-server
 
 ### 15.3 当前测试缺口
 
-- 没有扩展单元测试。
+- 扩展测试当前只覆盖纯消息边界，没有 Chrome API mock。
 - 没有浏览器 E2E。
 - 没有网关协议模糊测试。
 - 没有多连接并发测试。
@@ -917,42 +931,40 @@ cd apps/local-ai-server
 
 代价：
 
-- RFC 完整性、安全、健康检查和可观测性有限。
+- RFC 完整性、速率限制和可观测性仍有限。
 - 产品化时可能迁移到成熟 WebSocket / ASGI 实现。
 
 ## 17. 已知技术债
 
 按影响排序：
 
-1. 固定 7 秒分段导致高延迟。
+1. 能量启发式分段在噪声/音乐中可能误判，且整段 ASR 仍限制首条延迟。
 2. TTS 与播放完全未接入，但类型和设置容易让人误以为可用。
-3. 扩展协议类型和 `packages/protocol` 重复。
-4. `voxflow:pcm` Port 命名与当前职责不符。
-5. provider 设置与服务端实际 Hugging Face 固定实现不一致。
-6. `media.state` 和 `VIDEO_TIME` 尚未接通。
-7. Service Worker 内存状态不能可靠跨回收恢复。
-8. 本地服务缺少 token / Origin 校验。
-9. 模型冷启动没有 readiness 和预热机制。
-10. Worklet 缓冲和 Base64 路径复制较多。
-11. 共享 audio 包、VAD、TTS、sync、infra 中存在大量占位文件。
-12. 根目录缺少 CI、跨平台安装脚本和浏览器 E2E。
+3. `media.state` 和 `VIDEO_TIME` 尚未接通。
+4. Service Worker 内存状态不能可靠跨回收恢复。
+5. Token 仍需手工配置，Origin 默认规则尚未绑定精确扩展 ID。
+6. 健康检查能区分模型文件与加载状态，但尚未执行模型预热。
+7. Base64 音频路径仍有多份复制。
+8. VAD、TTS、sync、infra 中仍存在大量占位文件。
+9. 根目录缺少 CI、跨平台安装脚本和浏览器 E2E。
 
 ## 18. 演进路线
 
 ### P0：稳定当前文本链路
 
-- 统一协议单一事实来源。
-- 增加扩展消息和 Session 测试。
-- 明确 readiness、错误码和冷启动状态。
-- 增加模型完整性检查与下载脚本。
-- 完成本地 token 和 Origin 校验。
+- [x] 统一协议单一事实来源。
+- [x] 增加扩展消息和 Session 测试。
+- [x] 明确 readiness、错误码和冷启动状态。
+- [x] 增加模型完整性检查与 ASR / MT 下载脚本。
+- [x] 完成本地可选 Token 和 Origin 校验基础能力。
+- [ ] 自动生成/分发 Token，并把 Origin 收紧到精确扩展 ID。
 
 ### P1：降低首条字幕延迟
 
-- 接入 VAD。
-- 将固定 7 秒改为自然话语边界。
+- 接入服务端模型 VAD。
+- [x] 先用静音感知启发式替代固定 7 秒提交。
 - 支持 `asr.partial`。
-- 聚合 stats，减少协议噪声。
+- [x] 聚合 stats，减少协议噪声。
 - 建立延迟指标基线。
 
 ### P2：优化本地推理

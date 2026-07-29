@@ -1,6 +1,6 @@
 import { SubtitleOverlay } from '../core/subtitles/subtitle-overlay';
-import { connectPcmPort, onTabMessage, sendControl } from '../messaging/bridge';
-import type { PcmPort } from '../messaging/bridge';
+import { connectSessionPort, onTabMessage, sendControl } from '../messaging/bridge';
+import type { SessionPort } from '../messaging/bridge';
 import { PORT } from '../messaging/protocol';
 import { getSettings, onSettingsChanged } from '../store/settings';
 import { reportError } from '../lib/utils';
@@ -15,7 +15,7 @@ export default defineContentScript({
     if (scope[CONTENT_INSTANCE_KEY]) return;
     scope[CONTENT_INSTANCE_KEY] = true;
 
-    let port: PcmPort | null = null;
+    let port: SessionPort | null = null;
     let overlay: SubtitleOverlay | null = null;
     let startPromise: Promise<void> | null = null;
     let videoTimer: number | null = null;
@@ -58,7 +58,7 @@ export default defineContentScript({
         partial: true,
       });
 
-      port = connectPcmPort(PORT.PCM);
+      port = connectSessionPort(PORT.SESSION);
       port.on((msg) => {
         if (msg.kind === 'SUBTITLE') overlay?.update(msg.payload);
       });
@@ -106,7 +106,7 @@ export default defineContentScript({
       }
     }
 
-    function safePost(message: Parameters<PcmPort['post']>[0]): void {
+    function safePost(message: Parameters<SessionPort['post']>[0]): void {
       try {
         port?.post(message);
       } catch (error) {
